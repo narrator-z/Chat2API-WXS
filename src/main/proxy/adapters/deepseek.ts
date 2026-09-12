@@ -302,7 +302,12 @@ export class DeepSeekAdapter {
       else if (message.role === 'tool' && message.tool_call_id) {
         text = toolProfile.formatToolResult({
           toolCallId: message.tool_call_id,
-          content: String(message.content || ''),
+          content: Array.isArray(message.content)
+            ? message.content
+                .filter((item: any) => item.type === 'text')
+                .map((item: any) => item.text)
+                .join('\n')
+            : String(message.content ?? ''),
         })
       }
       else if (Array.isArray(message.content)) {

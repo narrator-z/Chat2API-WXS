@@ -1,0 +1,6 @@
+# Normalize line endings in the repository.
+#
+# Shell scripts must always be checked out with LF endings, otherwise they
+# fail on macOS/Linux (and under Git Bash on Windows) with errors such as
+# `$'\r': command not found`. This overrides `core.autocrlf=true`.
+*.sh text eol=lf

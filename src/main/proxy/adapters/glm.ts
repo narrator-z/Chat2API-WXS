@@ -327,7 +327,11 @@ export class GLMAdapter {
           role: 'user' as const,
           content: toolProfile.formatToolResult({
             toolCallId: msg.tool_call_id,
-            content: String(msg.content || ''),
+            content: typeof msg.content === 'string'
+              ? msg.content
+              : Array.isArray(msg.content)
+                ? msg.content.filter((c) => c.type === 'text').map((c) => c.text).join('')
+                : '',
           }),
         }
       }

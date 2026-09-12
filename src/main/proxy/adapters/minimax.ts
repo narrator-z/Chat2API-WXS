@@ -20,6 +20,11 @@ import {
   createBaseChunk,
   ToolCallState 
 } from '../utils/streamToolHandler'
+import {
+  buildImageOmissionNotice,
+  countImagesInMessages,
+  extractTextFromContent,
+} from '../utils/messageContent'
 
 const AGENT_BASE_URL = 'https://agent.minimaxi.com'
 
@@ -440,7 +445,7 @@ export class MiniMaxAdapter {
         return { 
           ...msg, 
           role: 'user' as const,
-          content: `[TOOL_RESULT for ${msg.tool_call_id}] ${msg.content || ''}` 
+          content: `[TOOL_RESULT for ${msg.tool_call_id}] ${extractTextFromContent(msg.content)}` 
         }
       }
       return msg
@@ -450,8 +455,7 @@ export class MiniMaxAdapter {
     let systemContent = ''
     const otherMessages = processedMessages.filter(msg => {
       if (msg.role === 'system') {
-        const text = typeof msg.content === 'string' ? msg.content : ''
-        systemContent = text
+        systemContent = extractTextFromContent(msg.content)
         return false
       }
       return true
@@ -477,13 +481,13 @@ export class MiniMaxAdapter {
       
       if (lastUserIdx !== -1) {
         const lastUserMsg = otherMessages[lastUserIdx]
-        const text = typeof lastUserMsg.content === 'string' ? lastUserMsg.content : ''
+        const text = extractTextFromContent(lastUserMsg.content)
         content += `user:${text}\n`
         
         // Include any tool results after the last user message
         for (let i = lastUserIdx + 1; i < otherMessages.length; i++) {
           if (otherMessages[i].role === 'user') {
-            const toolText = typeof otherMessages[i].content === 'string' ? otherMessages[i].content : ''
+            const toolText = extractTextFromContent(otherMessages[i].content)
             content += `user:${toolText}\n`
           }
         }
@@ -505,7 +509,7 @@ export class MiniMaxAdapter {
     
     if (otherMessages.length < 2) {
       content += otherMessages.reduce((acc, msg) => {
-        const text = typeof msg.content === 'string' ? msg.content : ''
+        const text = extractTextFromContent(msg.content)
         return acc + `${msg.role}:${text}\n`
       }, '')
     } else {
@@ -522,11 +526,17 @@ export class MiniMaxAdapter {
       }
       
       content += otherMessages.reduce((acc, msg) => {
-        const text = typeof msg.content === 'string' ? msg.content : ''
+        const text = extractTextFromContent(msg.content)
         return acc + `${msg.role}:${text}\n`
       }, '') + 'assistant:\n'
       
       content = content.trim().replace(/\!\[.+\]\(.+\)/g, '')
+    }
+
+    // MiniMax web channel is text-only; make image omission explicit
+    const imageCount = countImagesInMessages(otherMessages)
+    if (imageCount > 0) {
+      content += `\n${buildImageOmissionNotice(imageCount)}\n`
     }
 
     // Append tools prompt at the end if provided

@@ -371,12 +371,37 @@ export class ZaiAdapter {
     // Extract system message and merge with user message
     let systemContent = ''
     let processedMessages = []
-    
+    let imageCount = 0
+
     for (const msg of request.messages) {
+      // Normalize multimodal content arrays to plain text (Z.ai web channel
+      // has no image input path); count images for an explicit notice.
+      if (Array.isArray(msg.content)) {
+        imageCount += msg.content.filter((p: any) => p && p.type === 'image_url').length
+        const text = msg.content
+          .filter((p: any) => p && p.type === 'text' && typeof p.text === 'string')
+          .map((p: any) => p.text)
+          .join('\n')
+        msg = { ...msg, content: text }
+      }
       if (msg.role === 'system') {
         systemContent += (systemContent ? '\n\n' : '') + (typeof msg.content === 'string' ? msg.content : '')
       } else {
         processedMessages.push(msg)
+      }
+    }
+
+    if (imageCount > 0 && processedMessages.length > 0) {
+      const notice = `[Notice: ${imageCount} image(s) were sent by the user but omitted, because the current provider channel does not support image input. Please tell the user images cannot be processed.]`
+      for (let i = processedMessages.length - 1; i >= 0; i--) {
+        if (processedMessages[i].role === 'user') {
+          const prev = typeof processedMessages[i].content === 'string' ? processedMessages[i].content : ''
+          processedMessages[i] = {
+            ...processedMessages[i],
+            content: prev ? `${prev}\n\n${notice}` : notice,
+          }
+          break
+        }
       }
     }
     

@@ -9,6 +9,11 @@ import { PassThrough } from 'stream'
 import { createParser } from 'eventsource-parser'
 import { Account, Provider } from '../../store/types'
 import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
+import {
+  buildImageOmissionNotice,
+  countImagesInMessages,
+  extractTextFromContent,
+} from '../utils/messageContent'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
 
@@ -44,7 +49,7 @@ const MODEL_ALIASES: Record<string, string> = {
 
 interface QwenAiMessage {
   role: 'user' | 'assistant' | 'system'
-  content: string
+  content: string | any[]
 }
 
 interface ChatCompletionRequest {
@@ -310,12 +315,20 @@ export class QwenAiAdapter {
     // Single-turn mode: extract all messages
     for (const msg of messages) {
       if (msg.role === 'system') {
-        systemContent += (systemContent ? '\n\n' : '') + msg.content
+        systemContent += (systemContent ? '\n\n' : '') + extractTextFromContent(msg.content)
       } else if (msg.role === 'user') {
-        userContent = msg.content
+        userContent = extractTextFromContent(msg.content)
       }
     }
-    
+
+    // Images cannot be delivered through the t2t channel; make the omission
+    // explicit instead of silently dropping them (or worse, "[object Object]").
+    const imageCount = countImagesInMessages(messages)
+    if (imageCount > 0) {
+      const notice = buildImageOmissionNotice(imageCount)
+      userContent = userContent ? `${userContent}\n\n${notice}` : notice
+    }
+
     // If system prompt exists, prepend it to user content
     if (systemContent) {
       userContent = `${systemContent}\n\nUser: ${userContent}`

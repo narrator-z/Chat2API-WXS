@@ -4,19 +4,23 @@
  * Based on new chat2.qianwen.com API
  */
 
-import axios, { AxiosResponse } from 'axios'
+import axios from 'axios'
+import type { AxiosResponse } from 'axios'
+import crypto from 'crypto'
+import mime from 'mime-types'
 import { PassThrough } from 'stream'
 import { createGunzip, createInflate, createBrotliDecompress } from 'zlib'
 import * as ZstdCodec from 'zstd-codec'
 import { createParser } from 'eventsource-parser'
-import { Account, Provider } from '../../store/types'
-import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
-import { toolsToSystemPrompt, TOOL_WRAP_HINT, hasToolPromptInjected, shouldInjectToolPrompt } from '../utils/tools'
-import { parseToolCallsFromText } from '../utils/toolParser'
-import { createBaseChunk } from '../utils/streamToolHandler'
-import { getProviderToolProfile } from '../toolCalling/providerProfiles'
-import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
-import type { ToolCallingPlan } from '../toolCalling/types'
+import type { Account, Provider } from '../../store/types.ts'
+import { hasToolUse, parseToolUse } from '../promptToolUse.ts'
+import type { ToolCall } from '../promptToolUse.ts'
+import { toolsToSystemPrompt, TOOL_WRAP_HINT, hasToolPromptInjected, shouldInjectToolPrompt } from '../utils/tools.ts'
+import { parseToolCallsFromText } from '../utils/toolParser.ts'
+import { createBaseChunk } from '../utils/streamToolHandler.ts'
+import { getProviderToolProfile } from '../toolCalling/providerProfiles.ts'
+import { ToolStreamParser } from '../toolCalling/ToolStreamParser.ts'
+import type { ToolCallingPlan } from '../toolCalling/types.ts'
 
 /**
  * Check if content contains tool calls (both bracket and XML formats)
@@ -28,6 +32,13 @@ function hasToolCalls(content: string): boolean {
 const QWEN_API_BASE = 'https://chat2.qianwen.com'
 const QWEN_CHAT2_API_BASE = 'https://chat2-api.qianwen.com'
 const QWEN_CHAT_SIDE_API_BASE = 'https://chat-side.qianwen.com'
+const QWEN_WORKSPACE_API_BASE = 'https://workspace-res.qianwen.com'
+
+// Upload limits mirrored from the official web client defaults
+const QWEN_IMAGE_MAX_SIZE = 10 * 1024 * 1024
+const QWEN_IMAGE_MAX_COUNT = 10
+const QWEN_UPLOAD_CONTENT_TYPE = 'application/octet-stream'
+const QWEN_UPLOAD_ENTRY = 'qwen_pc'
 
 const MODEL_MAP: Record<string, string> = {
   'Qwen3.8-Max': 'Qwen3.8-Max',
@@ -111,6 +122,88 @@ function extractTextContent(content: string | any[]): string {
   return ''
 }
 
+function countImageContents(messages: Array<{ content?: string | any[] }>): number {
+  let total = 0
+  for (const msg of messages) {
+    if (Array.isArray(msg.content)) {
+      total += msg.content.filter((item: any) => item && item.type === 'image_url').length
+    }
+  }
+  return total
+}
+
+// ---- Image upload helpers (workspace-res.qianwen.com pipeline) ----
+// Reversed from the official web client (@ali/qianwen-web):
+//   1. POST /1/oss_token        -> { host, object, bucket, endpoint, authorization, oss_headers }
+//   2. PUT  {host}/{object}     -> raw bytes with Content-Md5 (base64) + authorization
+//   3. POST /1/oss/callback     -> { ws_gid, material_cdn_url, ... }
+//   4. POST /api/v2/file/record/add (chat-side) -> registers the file on the chat session
+//   5. chat message: { mime_type: 'image/url', meta_data: { resource_infos: [...] } }
+
+export interface QwenUploadedImage {
+  url: string
+  id: string
+  fileName: string
+  fileType: string
+  fileSize: number
+}
+
+export function computeContentMd5Base64(buffer: Buffer): string {
+  return crypto.createHash('md5').update(buffer).digest('base64')
+}
+
+export function imageFileTypeFromName(fileName: string): string {
+  const ext = fileName.split('.').pop() || ''
+  return ext.toUpperCase()
+}
+
+export function flattenOssHeaders(ossHeaders: unknown): Record<string, string> {
+  const headers: Record<string, string> = {}
+  if (Array.isArray(ossHeaders)) {
+    for (const item of ossHeaders) {
+      if (item && typeof item.key === 'string' && typeof item.value === 'string') {
+        headers[item.key] = item.value
+      }
+    }
+  }
+  return headers
+}
+
+export function buildImageResourceInfos(uploads: QwenUploadedImage[]): any[] {
+  return uploads.map((u) => ({
+    url: u.url,
+    id: u.id,
+    file_format: u.fileType.toLowerCase(),
+    file_name: u.fileName,
+    file_size: String(u.fileSize),
+  }))
+}
+
+export function buildImageMessages(uploads: QwenUploadedImage[]): any[] {
+  if (uploads.length === 0) return []
+  return [{
+    content: '',
+    mime_type: 'image/url',
+    status: 'complete',
+    meta_data: {
+      resource_infos: buildImageResourceInfos(uploads),
+    },
+  }]
+}
+
+export function extractImageDataUrls(messages: Array<{ role?: string, content?: string | any[] }>): string[] {
+  const urls: string[] = []
+  for (const msg of messages) {
+    if (msg.role !== 'user' || !Array.isArray(msg.content)) continue
+    for (const part of msg.content) {
+      if (part && part.type === 'image_url' && typeof part.image_url?.url === 'string') {
+        urls.push(part.image_url.url)
+      }
+    }
+  }
+  return urls
+}
+
 export class QwenAdapter {
   private provider: Provider
   private account: Account
@@ -161,6 +254,218 @@ export class QwenAdapter {
       ve: '1',
       ...extra,
     }
+  }
+
+  /**
+   * Resolve an image_url value (data URL or remote URL) to raw bytes.
+   */
+  private async resolveImageBytes(url: string): Promise<{ buffer: Buffer, mimeHint: string }> {
+    if (url.startsWith('data:')) {
+      const match = url.match(/^data:([^;,]+)?(;[^,]*)?,(.*)$/)
+      if (!match) {
+        throw new Error('Invalid data URL format')
+      }
+      const mimeHint = match[1] || ''
+      const isBase64 = (match[2] || '').includes('base64')
+      const buffer = isBase64
+        ? Buffer.from(match[3], 'base64')
+        : Buffer.from(decodeURIComponent(match[3]), 'utf-8')
+      return { buffer, mimeHint }
+    }
+
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      const response = await this.axiosInstance.get(url, {
+        responseType: 'arraybuffer',
+        timeout: 60000,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+      })
+      const mimeHint = (response.headers?.['content-type'] || '').split(';')[0].trim()
+      return { buffer: Buffer.from(response.data), mimeHint }
+    }
+
+    throw new Error('Unsupported image URL scheme')
+  }
+
+  /**
+   * Upload a single image through the qianwen workspace OSS pipeline.
+   * Returns the material info needed to compose an `image/url` chat message.
+   */
+  private async uploadImageToWorkspace(
+    buffer: Buffer,
+    mimeHint: string,
+    ticket: string
+  ): Promise<QwenUploadedImage> {
+    const ext = mime.extension(mimeHint || 'image/png') || 'png'
+    const fileName = `${uuid()}.${ext}`
+    const contentMd5 = computeContentMd5Base64(buffer)
+
+    const authHeaders = this.getApiHeaders(ticket)
+
+    // Step 1: request an OSS upload token
+    const tokenResponse = await this.axiosInstance.post(
+      `${QWEN_WORKSPACE_API_BASE}/1/oss_token`,
+      {
+        file_name: fileName,
+        content_type: QWEN_UPLOAD_CONTENT_TYPE,
+        content_md5: contentMd5,
+        size: buffer.length,
+      },
+      {
+        headers: authHeaders,
+        params: this.getApiParams({ req_id: uuid() }),
+        timeout: 30000,
+        validateStatus: () => true,
+      }
+    )
+
+    const tokenData = tokenResponse.data?.data
+    if (tokenResponse.status !== 200 || !tokenData?.host || !tokenData?.object) {
+      throw new Error(
+        `Qwen oss_token request failed: HTTP ${tokenResponse.status} ${JSON.stringify(tokenResponse.data || {}).substring(0, 300)}`
+      )
+    }
+
+    // Step 2: PUT the raw bytes to OSS
+    const putUrl = `${String(tokenData.host).replace(/\/+$/, '')}/${encodeURIComponent(tokenData.object)}`
+    const putResponse = await this.axiosInstance.put(putUrl, buffer, {
+      headers: {
+        ...flattenOssHeaders(tokenData.oss_headers),
+        'Content-Type': QWEN_UPLOAD_CONTENT_TYPE,
+        'Content-Md5': contentMd5,
+        ...(tokenData.authorization ? { authorization: tokenData.authorization } : {}),
+      },
+      params: { req_id: uuid(), biz_id: 'ai_qwen' },
+      timeout: 120000,
+      maxBodyLength: Infinity,
+      validateStatus: () => true,
+    })
+
+    if (putResponse.status < 200 || putResponse.status >= 300) {
+      throw new Error(`Qwen OSS PUT failed: HTTP ${putResponse.status}`)
+    }
+
+    // Step 3: notify the workspace service to finalize the upload
+    const callbackResponse = await this.axiosInstance.post(
+      `${QWEN_WORKSPACE_API_BASE}/1/oss/callback`,
+      {
+        file_md5: contentMd5,
+        file_name: fileName,
+        file_type: imageFileTypeFromName(fileName),
+        bucket: tokenData.bucket,
+        endpoint: tokenData.endpoint,
+        object: tokenData.object,
+        entry: QWEN_UPLOAD_ENTRY,
+      },
+      {
+        headers: authHeaders,
+        params: this.getApiParams({ req_id: uuid() }),
+        timeout: 30000,
+        validateStatus: () => true,
+      }
+    )
+
+    const callbackData = callbackResponse.data?.data
+    const materialUrl = callbackData?.material_cdn_url || callbackData?.material_url
+    if (callbackResponse.status !== 200 || !materialUrl || !callbackData?.ws_gid) {
+      throw new Error(
+        `Qwen oss callback failed: HTTP ${callbackResponse.status} ${JSON.stringify(callbackResponse.data || {}).substring(0, 300)}`
+      )
+    }
+
+    return {
+      url: materialUrl,
+      id: callbackData.ws_gid,
+      fileName: callbackData.file_name || fileName,
+      fileType: callbackData.file_type || imageFileTypeFromName(fileName),
+      fileSize: Number(callbackData.file_size) || buffer.length,
+    }
+  }
+
+  /**
+   * Register uploaded images on the chat-side file record service (best effort).
+   * The official client calls this before chatting so files show up in history.
+   */
+  private async registerFileRecords(
+    uploads: QwenUploadedImage[],
+    sessionId: string,
+    ticket: string
+  ): Promise<void> {
+    const batchId = uuid()
+    for (const upload of uploads) {
+      try {
+        await this.axiosInstance.post(
+          `${QWEN_CHAT_SIDE_API_BASE}/api/v2/file/record/add`,
+          {
+            fileName: upload.fileName,
+            fileType: 'image',
+            resourceKey: upload.id,
+            resourcePath: upload.url,
+            fileSize: upload.fileSize,
+            model: 'Qwen',
+            sessionId,
+            batchId,
+            resourceInfos: [{ key: upload.id, url: upload.url }],
+          },
+          {
+            headers: this.getApiHeaders(ticket),
+            params: this.getApiParams({ req_id: uuid() }),
+            timeout: 15000,
+            validateStatus: () => true,
+          }
+        )
+      } catch (error) {
+        console.warn('[Qwen] File record add failed (continuing):', error instanceof Error ? error.message : error)
+      }
+    }
+  }
+
+  /**
+   * Upload all user images found in the request messages.
+   * Returns the successfully uploaded images and the number of failures.
+   */
+  private async uploadChatImages(
+    messages: Array<{ role?: string, content?: string | any[] }>,
+    sessionId: string,
+    ticket: string
+  ): Promise<{ uploads: QwenUploadedImage[], failedCount: number }> {
+    const imageUrls = extractImageDataUrls(messages)
+    if (imageUrls.length === 0) {
+      return { uploads: [], failedCount: 0 }
+    }
+
+    const limitedUrls = imageUrls.slice(0, QWEN_IMAGE_MAX_COUNT)
+    const skippedCount = imageUrls.length - limitedUrls.length
+    if (skippedCount > 0) {
+      console.warn(`[Qwen] Skipping ${skippedCount} image(s) beyond the ${QWEN_IMAGE_MAX_COUNT} upload limit`)
+    }
+
+    const uploads: QwenUploadedImage[] = []
+    let failedCount = skippedCount
+
+    for (const url of limitedUrls) {
+      try {
+        const { buffer, mimeHint } = await this.resolveImageBytes(url)
+        if (buffer.length === 0) {
+          throw new Error('Empty image payload')
+        }
+        if (buffer.length > QWEN_IMAGE_MAX_SIZE) {
+          throw new Error(`Image exceeds ${QWEN_IMAGE_MAX_SIZE / 1024 / 1024}MB limit`)
+        }
+        const uploaded = await this.uploadImageToWorkspace(buffer, mimeHint, ticket)
+        uploads.push(uploaded)
+        console.log('[Qwen] Image uploaded:', uploaded.fileName, '->', uploaded.url.substring(0, 80))
+      } catch (error) {
+        failedCount++
+        console.warn('[Qwen] Image upload failed:', error instanceof Error ? error.message : error)
+      }
+    }
+
+    if (uploads.length > 0) {
+      await this.registerFileRecords(uploads, sessionId, ticket)
+    }
+
+    return { uploads, failedCount }
   }
 
   private extractSessionIds(data: any): string[] {
@@ -366,6 +671,26 @@ export class QwenAdapter {
 
     let userContent = conversationParts.join('\n\n')
 
+    // Upload user images through the qianwen workspace pipeline (domestic version).
+    // Images that fail to upload are reported to the model explicitly.
+    let imageMessages: any[] = []
+    const totalImageCount = countImageContents(request.messages)
+    if (totalImageCount > 0) {
+      try {
+        const { uploads, failedCount } = await this.uploadChatImages(request.messages, sessionId, ticket)
+        imageMessages = buildImageMessages(uploads)
+        console.log(`[Qwen] Image upload result: ${uploads.length} succeeded, ${failedCount} failed`)
+        if (failedCount > 0) {
+          const notice = `[Notice: ${failedCount} image(s) were sent by the user but could not be uploaded to the provider and were omitted. Please tell the user those images cannot be processed.]`
+          userContent = userContent ? `${userContent}\n\n${notice}` : notice
+        }
+      } catch (error) {
+        console.warn('[Qwen] Image upload pipeline error:', error instanceof Error ? error.message : error)
+        const notice = `[Notice: ${totalImageCount} image(s) were sent by the user but could not be uploaded to the provider and were omitted. Please tell the user those images cannot be processed.]`
+        userContent = userContent ? `${userContent}\n\n${notice}` : notice
+      }
+    }
+
     // Inject tools prompt if tools are provided and not already injected by client
     if (request.tools && request.tools.length > 0 && !hasToolPromptInjected(request.messages)) {
       const toolsPrompt = toolsToSystemPrompt(request.tools)
@@ -393,6 +718,7 @@ export class QwenAdapter {
       sub_scene: 'chat',
       temporary: false,
       messages: [
+        ...imageMessages,
         {
           content: finalContent,
           mime_type: 'text/plain',

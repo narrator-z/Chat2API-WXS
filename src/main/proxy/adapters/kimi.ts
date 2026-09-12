@@ -13,6 +13,11 @@ import { createKimiChatPayload, encodeKimiGrpcFrame } from './providerModelOptio
 import { getProviderToolProfile } from '../toolCalling/providerProfiles'
 import { ToolStreamParser } from '../toolCalling/ToolStreamParser'
 import type { ToolCallingPlan } from '../toolCalling/types'
+import {
+  buildImageOmissionNotice,
+  countImagesInMessages,
+  extractTextFromContent,
+} from '../utils/messageContent'
 
 // Kimi has upgraded to K3 (kimi.ai) for users outside mainland China.
 // www.kimi.com remains for mainland China users only.
@@ -180,7 +185,7 @@ export class KimiAdapter {
           role: 'user' as const,
           content: toolProfile.formatToolResult({
             toolCallId: msg.tool_call_id,
-            content: String(msg.content || ''),
+            content: extractTextFromContent(msg.content),
           }),
         }
       }
@@ -191,8 +196,7 @@ export class KimiAdapter {
     let systemContent = ''
     const otherMessages = processedMessages.filter(msg => {
       if (msg.role === 'system') {
-        const text = typeof msg.content === 'string' ? msg.content : ''
-        systemContent = text
+        systemContent = extractTextFromContent(msg.content)
         return false
       }
       return true
@@ -218,13 +222,13 @@ export class KimiAdapter {
       
       if (lastUserIdx !== -1) {
         const lastUserMsg = otherMessages[lastUserIdx]
-        const text = typeof lastUserMsg.content === 'string' ? lastUserMsg.content : ''
+        const text = extractTextFromContent(lastUserMsg.content)
         content += `user:${this.wrapUrlsToTags(text)}\n`
         
         // Include any tool results after the last user message
         for (let i = lastUserIdx + 1; i < otherMessages.length; i++) {
           if (otherMessages[i].role === 'user') {
-            const toolText = typeof otherMessages[i].content === 'string' ? otherMessages[i].content : ''
+            const toolText = extractTextFromContent(otherMessages[i].content)
             content += `user:${toolText}\n`
           }
         }
@@ -238,7 +242,7 @@ export class KimiAdapter {
 
     if (otherMessages.length < 2) {
       content += otherMessages.reduce((acc, msg) => {
-        const text = typeof msg.content === 'string' ? msg.content : ''
+        const text = extractTextFromContent(msg.content)
         return acc + `${msg.role === 'user' ? this.wrapUrlsToTags(text) : text}\n`
       }, '')
     } else {
@@ -259,9 +263,15 @@ export class KimiAdapter {
       }
 
       content += otherMessages.reduce((acc, msg) => {
-        const text = typeof msg.content === 'string' ? msg.content : ''
+        const text = extractTextFromContent(msg.content)
         return acc + `${msg.role}:${msg.role === 'user' ? this.wrapUrlsToTags(text) : text}\n`
       }, '')
+    }
+
+    // Kimi web channel is text-only; make image omission explicit
+    const imageCount = countImagesInMessages(otherMessages)
+    if (imageCount > 0) {
+      content += `\n${buildImageOmissionNotice(imageCount)}\n`
     }
 
     // Inject tools prompt at the VERY END of the content to maximize attention

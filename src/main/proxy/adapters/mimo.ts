@@ -268,8 +268,15 @@ function extractTextContent(content: ChatMessage['content']): string {
 export function buildMimoQuery(messages: MimoMessage[]): string {
   const toolProfile = getProviderToolProfile('mimo')
   const entries: Array<{ role: string; content: string }> = []
+  let imageCount = 0
 
   for (const message of messages) {
+    if (Array.isArray(message.content)) {
+      imageCount += (message.content as any[]).filter(
+        (part) => part && typeof part === 'object' && part.type === 'image_url'
+      ).length
+    }
+
     if (message.role === 'assistant' && message.tool_calls && message.tool_calls.length > 0) {
       entries.push({
         role: 'Assistant',
@@ -305,6 +312,13 @@ export function buildMimoQuery(messages: MimoMessage[]): string {
         : 'User'
 
     entries.push({ role, content })
+  }
+
+  if (imageCount > 0) {
+    entries.push({
+      role: 'System',
+      content: `[Notice: ${imageCount} image(s) were sent by the user but omitted, because the current provider channel does not support image input. Please tell the user images cannot be processed.]`,
+    })
   }
 
   if (entries.length === 1 && entries[0].role === 'User') {

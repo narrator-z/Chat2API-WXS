@@ -2,6 +2,17 @@
 
 本项目的所有重要变更都会记录在此文件中。
 
+## [未发布]
+
+### ✨ 新功能 (Features)
+
+- Qwen（国内版千问）支持真实图片上传：通过 `workspace-res.qianwen.com` 的 OSS 三步上传管线（oss_token → PUT → callback）与 `chat-side.qianwen.com` 会话文件登记，将 OpenAI 多模态请求中的图片（base64 data URL 或 http(s) URL，单图 ≤10MB、单次 ≤10 张）以官方客户端一致的 `image/url` 消息形态发送给模型；上传失败时自动降级为明确的"图片已省略"提示，不中断对话
+
+### 🐛 修复 (Bug Fixes)
+
+- 修复多模态图片输入导致的 `[object Object]` 与内容丢失问题：新增共享内容归一化工具 `utils/messageContent.ts`，Qwen AI/Kimi/MiniMax/Z.ai/DeepSeek/GLM 等适配器不再对数组型 `content` 直接字符串化；不支持图片输入的纯文本通道（Qwen AI、Kimi、MiniMax、Z.ai、Perplexity、Mimo）现在会向模型附加明确的"图片已省略"提示，而不是静默丢弃
+- 修复 `streamToolHandler.ts` 从 `toolParser/index.ts` 导入不存在符号 `createBaseChunk` 的问题（Vite 打包时被掩盖，Node ESM 直接加载会抛错）；`parseToolCallsFromText` 的导入统一指向正确的 `utils/toolParser.ts`
+
 ## [1.6.5] - 2026-08-31
 
 ### 🐛 修复 (Bug Fixes)

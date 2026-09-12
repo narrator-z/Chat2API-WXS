@@ -82,6 +82,7 @@ function extractQuery(messages: PerplexityMessage[]): string {
 
   // Build conversation history from all non-system messages
   const conversationParts: string[] = []
+  let imageCount = 0
   for (const msg of messages) {
     if (msg.role === 'system') continue
     
@@ -93,12 +94,20 @@ function extractQuery(messages: PerplexityMessage[]): string {
         .filter((item: any) => item.type === 'text')
         .map((item: any) => item.text)
       content = texts.join('\n')
+      imageCount += msg.content.filter((item: any) => item && item.type === 'image_url').length
     }
     
     if (content) {
       const roleLabel = msg.role === 'user' ? 'User' : 'Assistant'
       conversationParts.push(`[${roleLabel}]: ${content}`)
     }
+  }
+
+  // Perplexity sonar channel here is text-only; make image omission explicit
+  if (imageCount > 0) {
+    conversationParts.push(
+      `[Notice: ${imageCount} image(s) were sent by the user but omitted, because the current provider channel does not support image input. Please tell the user images cannot be processed.]`
+    )
   }
 
   const conversationHistory = conversationParts.join('\n\n')

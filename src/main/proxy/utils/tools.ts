@@ -3,8 +3,8 @@
  * Enables tool calling for models without native function calling support
  */
 
-import { ChatCompletionTool, ChatMessage } from '../types'
-import { CLIENT_SIGNATURES, GENERAL_TOOL_SIGNATURES, hasGeneralToolPromptSignature } from '../constants/signatures'
+import type { ChatCompletionTool, ChatMessage } from '../types.ts'
+import { CLIENT_SIGNATURES, GENERAL_TOOL_SIGNATURES, hasGeneralToolPromptSignature } from '../constants/signatures.ts'
 
 // Re-export for backward compatibility
 export const TOOL_PROMPT_SIGNATURES = {
@@ -20,7 +20,14 @@ export const TOOL_PROMPT_SIGNATURES = {
 export function hasToolPromptInjected(messages: ChatMessage[]): boolean {
   for (const msg of messages) {
     if (msg.role === 'system' || msg.role === 'user') {
-      const content = typeof msg.content === 'string' ? msg.content : ''
+      const content = typeof msg.content === 'string'
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content
+              .filter((part: any) => part && part.type === 'text' && typeof part.text === 'string')
+              .map((part: any) => part.text)
+              .join('\n')
+          : ''
       if (hasGeneralToolPromptSignature(content)) {
         console.log('[Tools] Detected existing tool prompt injection, skipping')
         return true
@@ -67,7 +74,14 @@ function isComplexQuery(messages: ChatMessage[], config: ToolPromptConfig): bool
   const lastUserMsg = [...messages].reverse().find(m => m.role === 'user')
   if (!lastUserMsg) return false
   
-  const content = typeof lastUserMsg.content === 'string' ? lastUserMsg.content : ''
+  const content = typeof lastUserMsg.content === 'string'
+    ? lastUserMsg.content
+    : Array.isArray(lastUserMsg.content)
+      ? lastUserMsg.content
+          .filter((part: any) => part && part.type === 'text' && typeof part.text === 'string')
+          .map((part: any) => part.text)
+          .join('\n')
+      : ''
   
   if (content.length > config.smartThreshold) {
     return true
