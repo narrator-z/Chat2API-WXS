@@ -373,9 +373,10 @@ export class ZaiAdapter {
     let processedMessages = []
     let imageCount = 0
 
-    for (const msg of request.messages) {
+    for (const originalMsg of request.messages) {
       // Normalize multimodal content arrays to plain text (Z.ai web channel
       // has no image input path); count images for an explicit notice.
+      let msg = originalMsg
       if (Array.isArray(msg.content)) {
         imageCount += msg.content.filter((p: any) => p && p.type === 'image_url').length
         const text = msg.content
