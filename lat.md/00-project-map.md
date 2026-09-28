@@ -8,6 +8,8 @@ Chat2API Manager is an Electron desktop app that exposes provider chat UIs and w
 - `src/main/proxy/` receives OpenAI-compatible requests, chooses accounts, maps models, and forwards calls to provider adapters.
 - `src/main/providers/builtin/` defines built-in provider metadata, credential fields, endpoints, and model mappings.
 - `src/main/oauth/` extracts and validates user tokens through manual token input or in-app browser login.
+- `src/main/lib/qwenAiAuth.ts` centralizes Qwen AI access-token expiry checks and refresh-cookie based token renewal, shared by the proxy adapter, OAuth adapter, and account checker.
+- `src/main/proxy/captchaWindow.ts` opens an Electron risk-control (Aliyun Baxia NoCaptcha) window when the WAF punish payload is detected, attempts automatic slider solving, and merges refreshed cookies back into the account store.
 - `src/renderer/src/` owns the React UI, provider/account management screens, logs, settings, and i18n.
 - `tests/` contains Node/Vitest-style coverage for providers, tool calling, request logs, renderer helpers, source artifacts, and skills.
 

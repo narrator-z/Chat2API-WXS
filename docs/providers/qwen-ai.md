@@ -6,8 +6,28 @@
 | 官网 | https://chat.qwen.ai |
 | API Base | https://chat.qwen.ai |
 | 认证 | JWT Token |
-| 凭据字段 | `token`, `cookies` |
+| 凭据字段 | `token`, `cookies`（含 `refresh_token`） |
 | Google / Gmail 登录 | 支持 |
+| Token 自动续期 | 支持（见下） |
+| 风控验证窗口 | 支持（见下） |
+
+## Token 自动续期
+
+Qwen AI 的 access token 有效期约 15 分钟，但 `refresh_token` Cookie 有效期约 300 天。应用在以下时机自动调用 `GET https://auth.qwen.ai/api/v2/auths/refresh`（携带 Cookie 中的 `refresh_token`）续期，并持久化新的 token 与 cookies：
+
+- 代理转发对话请求前（临期或收到 `unauthorized` / `token has expired` 时强制续期并重试一次）
+- 账号有效性检测前（token 临期时先续期再校验）
+- OAuth 适配器 `refreshToken` 调用时
+
+只要账号 cookies 中保留了 `refresh_token`，长期不重启应用也不会因 token 过期而不可用。
+
+## 风控验证窗口（WAF）
+
+当请求被阿里云 Baxia WAF 拦截（返回 `FAIL_SYS_USER_VALIDATE` / `RGV587_ERROR` 的 punish 载荷）时，应用会自动弹出一个验证窗口：
+
+- 窗口加载 punish 链接中的滑动验证码，并尝试自动完成滑动（类人轨迹，最多 3 次），失败时可手动滑动
+- 验证通过后自动收集窗口内所有 cookies 合并回账号存储，并自动重试被拦截的请求
+- 注意：风控拦截通常基于 IP，若自动/手动滑动均无法通过，请更换网络环境后重试
 
 ## 默认模型
 

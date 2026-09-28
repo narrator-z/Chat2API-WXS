@@ -5,6 +5,7 @@
 
 import axios from 'axios'
 import { BaseOAuthAdapter } from './base'
+import { extractQwenAiRefreshToken, refreshQwenAiToken } from '../../lib/qwenAiAuth'
 import {
   OAuthResult,
   OAuthOptions,
@@ -107,12 +108,9 @@ export class QwenAiAdapter extends BaseOAuthAdapter {
         
         if (payload && (payload.sub || payload.id || payload.user_id || payload.uid)) {
           const userId = payload.sub || payload.id || payload.user_id || payload.uid
-          const cookies = typeof credentials.cookies === 'string' ? JSON.parse(credentials.cookies) : credentials.cookies
-          
-          console.log('[QwenAi OAuth] JWT payload keys:', Object.keys(payload), 'userId:', userId, 'has cookies:', !!cookies)
           
           try {
-            const userInfo = await this.getUserInfo(token, cookies)
+            const userInfo = await this.getUserInfo(token)
             console.log('[QwenAi OAuth] User info:', userInfo)
             
             if (userInfo && userInfo.is_guest === true) {
@@ -158,30 +156,27 @@ export class QwenAiAdapter extends BaseOAuthAdapter {
     }
   }
 
-  async getUserInfo(token: string, cookies?: Record<string, string>): Promise<Record<string, unknown> | null> {
+  async getUserInfo(token: string): Promise<Record<string, unknown> | null> {
     try {
-      const headers: Record<string, string> = {
-        Authorization: `Bearer ${token}`,
-        ...FAKE_HEADERS,
-      }
-      if (cookies && Object.keys(cookies).length > 0) {
-        headers.Cookie = Object.entries(cookies)
-          .map(([k, v]) => `${k}=${v}`)
-          .join('; ')
-      }
-      const response = await axios.get(`${QWEN_AI_API_BASE}/api/v2/user/info`, {
-        headers,
+      // Official endpoint migrated from chat.qwen.ai/api/v2/user to auth.qwen.ai/api/v2/auths/
+      const response = await axios.get('https://auth.qwen.ai/api/v2/auths/', {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          source: 'web',
+        },
         timeout: 15000,
         validateStatus: () => true,
       })
-      
+
       console.log('[QwenAi OAuth] getUserInfo response status:', response.status, 'data.success:', response.data?.success)
-      
+
       if (response.status !== 200 || !response.data?.success) {
-        console.log('[QwenAi OAuth] getUserInfo failed, status:', response.status, 'response:', JSON.stringify(response.data).substring(0, 300))
+        console.log('[QwenAi OAuth] getUserInfo failed, response:', JSON.stringify(response.data).substring(0, 300))
         return null
       }
-      
+
       return response.data.data
     } catch (error) {
       console.log('[QwenAi OAuth] getUserInfo error:', error instanceof Error ? error.message : error)
@@ -190,7 +185,25 @@ export class QwenAiAdapter extends BaseOAuthAdapter {
   }
 
   async refreshToken(credentials: Record<string, string>): Promise<CredentialInfo | null> {
-    return null
+    const refreshToken = extractQwenAiRefreshToken(credentials)
+
+    if (!refreshToken) {
+      console.log('[QwenAi OAuth] refreshToken: no refresh_token available')
+      return null
+    }
+
+    const refreshed = await refreshQwenAiToken(refreshToken)
+    if (!refreshed) {
+      console.log('[QwenAi OAuth] refreshToken failed')
+      return null
+    }
+
+    console.log('[QwenAi OAuth] refreshToken succeeded')
+    return {
+      type: 'access',
+      value: refreshed.accessToken,
+      refreshToken: refreshed.refreshToken,
+    }
   }
 }
 

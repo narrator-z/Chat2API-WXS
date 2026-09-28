@@ -8,6 +8,13 @@ import axios, { AxiosResponse } from 'axios'
 import { PassThrough } from 'stream'
 import { createParser } from 'eventsource-parser'
 import { Account, Provider } from '../../store/types'
+import { storeManager } from '../../store/store'
+import {
+  extractQwenAiRefreshToken,
+  isQwenAiTokenExpiring,
+  refreshQwenAiToken,
+  replaceRefreshTokenCookie,
+} from '../../lib/qwenAiAuth'
 import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
 import {
   buildImageOmissionNotice,
@@ -16,6 +23,19 @@ import {
 } from '../utils/messageContent'
 
 const QWEN_AI_BASE = 'https://chat.qwen.ai'
+
+// NOTE: The real web client (verified via browser capture on 2026-09-28) does NOT
+// send bx-v / bx-umidtoken / bx-ua headers. Those were stale hardcoded Baxia
+// fingerprints which actively trigger the Aliyun WAF punish/captcha flow
+// (FAIL_SYS_USER_VALIDATE / RGV587_ERROR). Keep headers aligned with the browser:
+// Accept, Accept-Language, Content-Type, Version, Timezone, source, X-Request-Id,
+// X-Accel-Buffering, Authorization (+ browser-managed cookies).
+const WEB_VERSION = '0.3.12'
+
+function getTimezoneHeader(): string {
+  // Browser sends e.g. "Mon Sep 28 2026 19:16:20 GMT+0800" (no tz name suffix)
+  return new Date().toString().replace(/\s*\([^)]*\)\s*$/, '')
+}
 
 const DEFAULT_HEADERS = {
   Accept: 'application/json',
@@ -29,12 +49,69 @@ const DEFAULT_HEADERS = {
   'Sec-Fetch-Dest': 'empty',
   'Sec-Fetch-Mode': 'cors',
   'Sec-Fetch-Site': 'same-origin',
-  'bx-v': '2.5.36',
-  'bx-umidtoken': 'T2gAr9z8byN8sNOmfQ3X9j61MNTNmSqDO5L1rs2jMcQCVhOKgZICcBN-UdTuJGig-NM=',
-  'bx-ua': '231!lWD36kmUe5E+joKDK5gBZ48FEl2ZWfPwIPF92lBLek2KxVW/XJ2EwruCiDOX5Px4EXNhmh6EfS9eDwQGRwijIK64A4nPqeLysJcDjUACje/H3J4ZgGZpicG6K8AkiGGaEKC830+QSiSUsLRlL/EyhXTmLcJc/5iDkMuOpUhNz0e0Q/nTqjVJ3ko00Q/oyE+jauHhUHfb1GxGHkE+++3+qCS4+ItkaA6tiItCo+romzElfLFD6RIj7oHt9vffs98nLwpHnaqKjufnLFMejSlAUGiQvTofIiGhIvftAMcoFV4mrUHsqyQ/ncQihmJHkbxXjvM57FCb6b9dEIRZl7jgj0+QLNLRs0NZ4azdZ6rzbGTSO8KA5I3Aq/3gBr87X16Mj0oJtaPKmFGaP2zghfOVhxQht8YjRd50lJa+Ue4PAuPSdu2O69DKLH8VOhrsB+psaBIRxnRi5POUQ6w8s8qlb9vxvExjHNOAKWXV1by1Nz+6FPWdyTeAgcmonjCcV0dCtPj/KyeVDkeSrDkKZjnDzHEqeCdfmJ65kve+Vy3YS0vagzyHfVEnzN0ULUZtkGfJXFNm6+bIa55wmGBhUeXbHL0EdlQXMu1YXxmcwBgTaq7tlQcfv7AefanbfjGE8R1IFnNyg2/jXLbnLg5Z6l1oKqgnxZQg0DE9BJuw6s0XjGwTdSxybWxp+WFD/RsXt76uwvCBk7z+YmSFLtFj2UlTsoq+vl0DTmsVItDKf9SZ94NcuJ7mxJYI02S/2kQBfbbHG0d4hXevDrEC0cb86EvzN2ud+v6bAunNRGNFz/RH0KLusoBVeo+puCFKeeIJWEo0t1UicX5YxJwMAoV7+g0gK93y4W9sMQtso8/wY5wsBzis9dwfLvIwXpaAM1g0MZp/YIRq8T/Qc+U/8x99tam4er0IWizvrkjqhIzCWBKpJ4Y4gj3bOmiS3VCMEaoVfKCwUWENwYKuP3H5VI0n+O2vVVRrekUrwvkm6URRhVhN4eEFTCjB9nSQu++qKyDH8HPpkS3YfwF8/OQtrZo7hQXxvNmP2HcH/K7zcweD00BaoOLiYUtXRItGYbl06sVSbm04soRf1Jqpyo3XiRqBWD9rmJfr4w8NOEGVGUCKXLDLsXy+8JC4Iqf0FsIjWxjMVdraTUtCbwXRbYUownQVm6bt7LYD1SNPoWNPqUJgsLMwP33ugrb1UbHCs24roOch6Go5QHIPA8E15SZE9pkr1SkmqrNs/+KRomFJ9HyFnWUYhZIV9MRLqlOAt6XBBTash3WJnCjhx/PZGhXVvdn2jX4+0Pm55LsiNugA8vaAUJQBxD/8a1u/RvTgbj35+b7I7m8tG0hMhClNZF+tpsOmZZhUGuXH9uVbkJMlMuAmMVCHwn3O31GlLeXXzzep2WS3xN2U+p5J0I7GySnuZUkuGs1ZTVqGUvR2g4q+7ljU55Ak78yPZiQXeUeqS74azszvZvCqWxXn2eePj+gcpliOjrYKpglUP19rQrMt8PqLt8L0ghIqVCmMwl3Hgr/VUcqDpXdpPTR=',
-  Timezone: 'Mon Feb 23 2026 22:06:02 GMT+0800',
-  Version: '0.2.7',
+  Version: WEB_VERSION,
   Origin: 'https://chat.qwen.ai',
+}
+
+/**
+ * Decode the user id (uid) from the JWT access token payload.
+ * Qwen AI tokens use `id` in the payload; `sub` kept as fallback.
+ */
+function getUidFromToken(token: string): string {
+  if (!token) return ''
+  try {
+    const part = token.split('.')[1]
+    if (!part) return ''
+    const payload = JSON.parse(Buffer.from(part, 'base64').toString('utf8'))
+    return payload.id || payload.sub || ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * The web client sets `cnaui=<uid>` and `aui=<uid>` cookies after login.
+ * Cookies captured during in-app login may miss them; append when absent.
+ */
+function ensureUidCookies(cookies: string, uid: string): string {
+  if (!uid) return cookies
+  const parts = cookies ? cookies.split(';').map((c) => c.trim()).filter(Boolean) : []
+  const hasCnaui = parts.some((c) => c.startsWith('cnaui='))
+  const hasAui = parts.some((c) => c.startsWith('aui='))
+  if (!hasCnaui) parts.push(`cnaui=${uid}`)
+  if (!hasAui) parts.push(`aui=${uid}`)
+  return parts.join('; ')
+}
+
+/**
+ * Detect Aliyun/Baxia WAF risk-control punish responses such as:
+ * {"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试"],"data":{"url":"...punish..."}}
+ */
+function getRiskControlMessage(data: any): string | null {
+  if (!data || typeof data !== 'object') return null
+  const ret = Array.isArray(data.ret) ? data.ret : []
+  const retStr = ret.map(String).join('|')
+  if (retStr.includes('FAIL_SYS_USER_VALIDATE') || retStr.includes('RGV587')) {
+    return `Qwen AI 风控拦截（需要验证码校验）：${retStr || 'FAIL_SYS_USER_VALIDATE'}。请稍后重试；若持续出现，请重新登录该账号以刷新 cookies。`
+  }
+  return null
+}
+
+const RISK_CONTROL_BLOCKED_MESSAGE =
+  'Qwen AI 风控拦截（需要验证码校验）：验证码未完成或验证后仍被拦截，请稍后重试。'
+
+/** Extract the punish/captcha url from a WAF risk-control payload text. */
+function extractPunishUrl(text: string): string | null {
+  if (!text.includes('FAIL_SYS_USER_VALIDATE') && !text.includes('RGV587')) return null
+  try {
+    const parsed = JSON.parse(text)
+    const url = parsed?.data?.url
+    if (typeof url === 'string' && url) return url
+  } catch {
+    // Not JSON; fall through to regex extraction.
+  }
+  const match = text.match(/https?:[^"'\s]+punish[^"'\s]*/)
+  return match ? match[0] : null
 }
 
 const MODEL_ALIASES: Record<string, string> = {
@@ -107,7 +184,17 @@ function isFinishedStatus(status: any): boolean {
 }
 
 function getQwenAiErrorMessage(data: any): string | null {
-  if (!data || typeof data !== 'object' || data.success !== false) {
+  if (!data || typeof data !== 'object') {
+    return null
+  }
+
+  // WAF risk-control punish payload (not a success:false envelope)
+  const riskControl = getRiskControlMessage(data)
+  if (riskControl) {
+    return riskControl
+  }
+
+  if (data.success !== false) {
     return null
   }
 
@@ -119,6 +206,13 @@ function getQwenAiErrorMessage(data: any): string | null {
 export class QwenAiAdapter {
   private provider: Provider
   private account: Account
+  /**
+   * Optional hook invoked when the Aliyun WAF risk-control punish is detected
+   * on the completions stream. Implementations typically open a captcha
+   * window; resolves with the refreshed cookie string once the user solved
+   * the captcha (or null when unsolved/closed).
+   */
+  onRiskControl?: (punishUrl?: string) => Promise<string | null>
   private axiosInstance = axios.create({
     timeout: 120000,
     maxBodyLength: Infinity,
@@ -135,15 +229,57 @@ export class QwenAiAdapter {
     return credentials.token || credentials.accessToken || credentials.apiKey || ''
   }
 
+  /**
+   * Qwen AI access tokens expire after ~15 minutes. The official client
+   * silently refreshes them via GET auth.qwen.ai/api/v2/auths/refresh using
+   * the refresh_token cookie plus the `x-request-origin` header. Mirror that
+   * behaviour so long-lived proxy sessions never hit "Token has expired".
+   */
+  async ensureValidToken(force: boolean = false): Promise<string> {
+    const current = this.getToken()
+    if (!force && !isQwenAiTokenExpiring(current)) {
+      return current
+    }
+
+    const refreshToken = extractQwenAiRefreshToken(this.account.credentials)
+    if (!refreshToken) {
+      return current
+    }
+
+    console.log('[QwenAI] Access token expiring/expired, refreshing via auth.qwen.ai...')
+    const refreshed = await refreshQwenAiToken(refreshToken)
+    if (!refreshed) {
+      return current
+    }
+
+    this.account.credentials = {
+      ...this.account.credentials,
+      token: refreshed.accessToken,
+      refresh_token: refreshed.refreshToken,
+      cookies: replaceRefreshTokenCookie(this.getCookies(), refreshed.refreshToken),
+    }
+
+    try {
+      storeManager.updateAccount(this.account.id, { credentials: { ...this.account.credentials } })
+      console.log('[QwenAI] Refreshed token persisted for account', this.account.id)
+    } catch (error) {
+      console.error('[QwenAI] Failed to persist refreshed token:', error)
+    }
+
+    return refreshed.accessToken
+  }
+
   private getCookies(): string {
     const credentials = this.account.credentials
     return credentials.cookies || credentials.cookie || ''
   }
 
   private getHeaders(chatId?: string): Record<string, string> {
+    const token = this.getToken()
     const headers: Record<string, string> = {
       ...DEFAULT_HEADERS,
-      Authorization: `Bearer ${this.getToken()}`,
+      Timezone: getTimezoneHeader(),
+      Authorization: `Bearer ${token}`,
       'X-Request-Id': uuid(),
     }
 
@@ -151,7 +287,8 @@ export class QwenAiAdapter {
       headers['Referer'] = `https://chat.qwen.ai/c/${chatId}`
     }
 
-    const cookies = this.getCookies()
+    // The web client always carries cnaui/aui (uid) cookies; append them when missing.
+    const cookies = ensureUidCookies(this.getCookies(), getUidFromToken(token))
     if (cookies) {
       headers['Cookie'] = cookies
     } else {
@@ -194,6 +331,8 @@ export class QwenAiAdapter {
   }
 
   async createChat(modelId: string, title: string = 'New Chat'): Promise<string> {
+    await this.ensureValidToken()
+
     const url = `${QWEN_AI_BASE}/api/v2/chats/new`
     const payload = {
       title,
@@ -204,10 +343,22 @@ export class QwenAiAdapter {
       project_id: '',
     }
 
-    try {
-      const response = await this.axiosInstance.post(url, payload, {
+    const post = () =>
+      this.axiosInstance.post(url, payload, {
         headers: this.getHeaders(),
       })
+
+    try {
+      let response = await post()
+
+      // Server-side rejection despite a locally-valid exp (clock skew or
+      // early revocation): force-refresh the token and retry once.
+      const details = String(response.data?.data?.details || '')
+      if (response.data?.data?.code === 'unauthorized' || /token has expired/i.test(details)) {
+        console.log('[QwenAI] createChat unauthorized, forcing token refresh and retrying...')
+        await this.ensureValidToken(true)
+        response = await post()
+      }
 
       console.log('[QwenAI] Create chat response:', JSON.stringify(response.data, null, 2))
 
@@ -303,7 +454,7 @@ export class QwenAiAdapter {
     }
 
     // Always create a new chat (single-turn mode only)
-    const chatId = await this.createChat(modelId, 'OpenAI_API_Chat')
+    let chatId = await this.createChat(modelId, 'OpenAI_API_Chat')
     console.log('[QwenAI] Created new chat:', chatId)
 
     const messages = request.messages
@@ -389,9 +540,46 @@ export class QwenAiAdapter {
       timestamp: ts + 1,
     }
 
+    let response = await this.postCompletions(payload, chatId)
+
+    // Probe the first stream chunk for the WAF punish payload. When detected
+    // and a captcha hook is available, let the user solve the slider and then
+    // retry the request once with the refreshed cookies.
+    if (this.onRiskControl) {
+      let probe = await this.probeStream(response)
+      if (probe.riskControl) {
+        probe.stream.destroy?.()
+        console.log('[QwenAI] Risk control detected, requesting captcha verification...')
+        const refreshedCookies = await this.onRiskControl(probe.punishUrl || undefined)
+        if (!refreshedCookies) {
+          throw new Error(RISK_CONTROL_BLOCKED_MESSAGE)
+        }
+        // Use the refreshed (captcha-trusted) cookies for the retry.
+        this.account.credentials = { ...this.account.credentials, cookies: refreshedCookies }
+        chatId = await this.createChat(modelId, 'OpenAI_API_Chat')
+        payload.chat_id = chatId
+        console.log('[QwenAI] Retrying after captcha with new chat:', chatId)
+        response = await this.postCompletions(payload, chatId)
+        probe = await this.probeStream(response)
+        if (probe.riskControl) {
+          probe.stream.destroy?.()
+          throw new Error(RISK_CONTROL_BLOCKED_MESSAGE)
+        }
+      }
+      response = { ...response, data: probe.stream } as AxiosResponse
+    }
+
+    return {
+      response,
+      chatId,
+      parentId: null,
+    }
+  }
+
+  private async postCompletions(payload: Record<string, any>, chatId: string): Promise<AxiosResponse> {
     const url = `${QWEN_AI_BASE}/api/v2/chat/completions?chat_id=${chatId}`
 
-    console.log('[QwenAI] Sending request to /api/v2/chat/completions...', { chatId, model: modelId })
+    console.log('[QwenAI] Sending request to /api/v2/chat/completions...', { chatId, model: payload.model })
 
     const response = await this.axiosInstance.post(url, payload, {
       headers: {
@@ -403,12 +591,44 @@ export class QwenAiAdapter {
     })
 
     console.log('[QwenAI] Response status:', response.status)
+    return response
+  }
 
-    return {
-      response,
-      chatId,
-      parentId: null,
-    }
+  /**
+   * Read the first chunk of the completions stream without losing it: the
+   * chunk is replayed into a PassThrough which also receives the remainder
+   * of the original stream, so downstream handlers see an intact stream.
+   */
+  private probeStream(response: AxiosResponse): Promise<{
+    riskControl: boolean
+    punishUrl: string | null
+    stream: any
+  }> {
+    return new Promise((resolve) => {
+      const source = response.data
+      const replay = new PassThrough()
+      const settle = (first: Buffer) => {
+        const text = first.toString()
+        const punishUrl = extractPunishUrl(text)
+        if (first.length) replay.write(first)
+        source.pipe(replay)
+        resolve({ riskControl: punishUrl !== null, punishUrl, stream: replay })
+      }
+      const onData = (chunk: Buffer) => {
+        source.pause()
+        source.removeListener('data', onData)
+        settle(chunk)
+      }
+      source.on('data', onData)
+      source.once('end', () => {
+        source.removeListener('data', onData)
+        settle(Buffer.alloc(0))
+      })
+      source.once('error', () => {
+        source.removeListener('data', onData)
+        settle(Buffer.alloc(0))
+      })
+    })
   }
 
   static isQwenAiProvider(provider: Provider): boolean {
@@ -708,6 +928,10 @@ export class QwenAiStreamHandler {
       const trimmed = text.trim()
       if (trimmed.startsWith('{')) {
         try {
+          // Covers both success:false envelopes and WAF risk-control payloads
+          // ({"ret":["FAIL_SYS_USER_VALIDATE", "RGV587_ERROR::..."]}) which are
+          // plain JSON (not SSE) and would otherwise be silently dropped,
+          // producing an empty response on the frontend.
           const upstreamError = getQwenAiErrorMessage(JSON.parse(trimmed))
           if (upstreamError) {
             sendError(upstreamError)
@@ -716,6 +940,11 @@ export class QwenAiStreamHandler {
         } catch {
           // Continue through the SSE parser for partial or non-JSON chunks.
         }
+      }
+      // WAF punish HTML/JS challenge page (aliyun_waf_aa) is also non-SSE
+      if (trimmed.includes('FAIL_SYS_USER_VALIDATE') || trimmed.includes('RGV587') || trimmed.includes('aliyun_waf')) {
+        sendError('Qwen AI 风控拦截（需要验证码校验），请稍后重试；若持续出现，请重新登录该账号以刷新 cookies。')
+        return
       }
       parser.feed(text)
     })

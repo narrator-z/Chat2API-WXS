@@ -2,6 +2,23 @@
 
 本项目的所有重要变更都会记录在此文件中。
 
+## [1.6.9] - 2026-09-28
+
+### ✨ 新功能 (Features)
+
+- Qwen AI（国际版）access token 自动续期：token 有效期仅约 15 分钟，新增共享模块 `src/main/lib/qwenAiAuth.ts`，利用 cookies 中有效期约 300 天的 `refresh_token` 调用官方 `/api/v2/auths/refresh` 接口自动换新 token 并持久化；代理转发前临期自动续期（收到 `unauthorized`/`token has expired` 时强制续期并重试一次）、账号检测前自动续期、OAuth 适配器实现 `refreshToken`，长期挂机不再因 token 过期失效
+- Qwen AI 风控（WAF）验证窗口：请求被阿里云 Baxia 拦截（`FAIL_SYS_USER_VALIDATE`/`RGV587_ERROR`）时自动弹出独立验证窗口，加载 punish 滑动验证码并尝试自动滑动（类人轨迹 + 跨 iframe 定位，最多 3 次，失败可手动完成），验证通过后自动合并窗口内 cookies 回账号存储并重试原请求；同时在窗口内注入状态条提示进度
+
+### 🐛 修复 (Bug Fixes)
+
+- 修复 Qwen AI 登录窗口有时"不能自动读取" token 的问题：页面反爬脚本阻塞渲染进程主线程时 `executeJavaScript` 读取 localStorage 会永久挂起，导致 cookie 分支永远得不到执行；现在优先直接通过 Electron cookies API 检查 token（不依赖页面脚本），localStorage 读取增加 3 秒超时与重入保护，卡死的检查不再阻塞后续轮询
+- Qwen AI 代理请求移除失效的 `bx-v`/`bx-umidtoken`/`bx-ua` 指纹头（陈旧指纹反而会触发风控），并补齐 `cnaui`/`aui` cookie；风控空响应时返回明确错误信息而非静默失败
+
+### 📦 其他 (Other)
+
+- 新增 Qwen AI 调试探测脚本：`scripts/qwen-refresh-full.cjs`（完整官方请求头刷新验证）、`qwen-refresh-matrix.cjs`（请求头矩阵排查）、`qwen-refresh-probe.cjs`、`qwen-bundle-analyze.cjs`（官方前端 bundle 分析）、`qwen-completions-probe.mjs`（对话链路风控复现）
+- 文档同步：`docs/providers/qwen-ai.md` 新增"Token 自动续期"与"风控验证窗口"章节，`lat.md/00-project-map.md` 补充新增模块说明
+
 ## [1.6.8] - 2026-09-28
 
 ### 🐛 修复 (Bug Fixes)

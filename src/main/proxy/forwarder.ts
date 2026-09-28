@@ -826,6 +826,18 @@ export class RequestForwarder {
       const transformed = this.transformRequestForPromptToolUse(request, provider)
       
       const adapter = new QwenAiAdapter(provider, account)
+      // When the Aliyun WAF risk-control punish is detected, open a captcha
+      // window so the user can solve the slider; refreshed cookies are
+      // persisted and the request is retried automatically once.
+      adapter.onRiskControl = async (punishUrl?: string) => {
+        try {
+          const { openQwenAiCaptchaWindow } = await import('./captchaWindow')
+          return await openQwenAiCaptchaWindow(account.id, punishUrl)
+        } catch (error) {
+          console.error('[Forwarder] Failed to open Qwen AI captcha window:', error)
+          return null
+        }
+      }
       const { response, chatId, parentId } = await adapter.chatCompletion({
         model: actualModel,
         originalModel: request.model,

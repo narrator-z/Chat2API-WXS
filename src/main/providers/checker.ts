@@ -2,6 +2,13 @@ import axios, { AxiosError } from 'axios'
 import { getBuiltinProvider } from './builtin'
 import type { Provider, ProviderCheckResult, Account } from '../../shared/types'
 import type { BuiltinProviderConfig } from '../store/types'
+import {
+  extractQwenAiRefreshToken,
+  isQwenAiTokenExpiring,
+  refreshQwenAiToken,
+  replaceRefreshTokenCookie,
+} from '../lib/qwenAiAuth'
+import { storeManager } from '../store/store'
 
 const CHECK_TIMEOUT = 15000
 
@@ -144,7 +151,7 @@ export class ProviderChecker {
       case 'qwen':
         return this.checkQwenToken(account.credentials.ticket)
       case 'qwen-ai':
-        return this.checkQwenAiToken(account.credentials.token)
+        return this.checkQwenAiToken(account)
       case 'perplexity':
         return this.checkPerplexityToken(account.credentials.sessionToken || account.credentials.token)
       case 'mimo':
@@ -538,10 +545,41 @@ export class ProviderChecker {
     }
   }
 
-  private static async checkQwenAiToken(token: string): Promise<TokenCheckResult> {
+  private static async checkQwenAiToken(account: Account): Promise<TokenCheckResult> {
+    let token = account.credentials.token
+
+    // Access tokens expire after ~15 minutes; refresh proactively so the
+    // periodic status check doesn't flip healthy accounts to "error".
+    if (isQwenAiTokenExpiring(token)) {
+      const refreshToken = extractQwenAiRefreshToken(account.credentials)
+      if (refreshToken) {
+        const refreshed = await refreshQwenAiToken(refreshToken)
+        if (refreshed) {
+          console.log('[QwenAI] Checker refreshed access token for account', account.id)
+          token = refreshed.accessToken
+          const updatedCredentials = {
+            ...account.credentials,
+            token: refreshed.accessToken,
+            refresh_token: refreshed.refreshToken,
+            cookies: replaceRefreshTokenCookie(
+              account.credentials.cookies || account.credentials.cookie || '',
+              refreshed.refreshToken
+            ),
+          }
+          account.credentials = updatedCredentials
+          try {
+            storeManager.updateAccount(account.id, { credentials: { ...updatedCredentials } })
+          } catch (error) {
+            console.error('[QwenAI] Checker failed to persist refreshed token:', error)
+          }
+        }
+      }
+    }
+
     try {
+      // Official endpoint migrated from chat.qwen.ai/api/v2/user to auth.qwen.ai/api/v2/auths/
       const response = await axios.get(
-        'https://chat.qwen.ai/api/v2/user',
+        'https://auth.qwen.ai/api/v2/auths/',
         {
           headers: {
             Authorization: `Bearer ${token}`,

@@ -3,7 +3,7 @@
  * Manages in-app browser window for OAuth login and token extraction
  */
 
-import { BrowserWindow, session, Session } from 'electron'
+import { BrowserWindow, session, Session, WebContents } from 'electron'
 import { EventEmitter } from 'events'
 import { ProviderType } from './types'
 import { TokenExtractionConfig, getTokenExtractionConfig, TokenSource } from './tokenExtractionConfig'
@@ -60,6 +60,8 @@ export class InAppLoginManager extends EventEmitter {
   private lastTokenCheckTime: number = 0
   private options: InAppLoginOptions | null = null
   private loadRetryCount: number = 0
+  private tokenCheckRunning: boolean = false
+  private tokenCheckQueued: boolean = false
 
   constructor() {
     super()
@@ -375,7 +377,34 @@ export class InAppLoginManager extends EventEmitter {
           if (this.isValidToken(cookie.value)) {
             console.log('[InAppLogin] Cookie token is valid, emitting tokenFound')
             this.foundTokens.set(source.key, cookie.value)
-            this.emit('tokenFound', { key: source.key, value: cookie.value })
+            // Collect all cookies so the manager can pass them to validateToken
+            try {
+              const allBrowserCookies = await this.loginSession.cookies.get({})
+              const targetDomains = this.config?.targetDomains || []
+              let cookiesToSearch = allBrowserCookies
+              for (const domain of targetDomains) {
+                try {
+                  const domainCookies = await this.loginSession.cookies.get({ domain })
+                  for (const dc of domainCookies) {
+                    if (!cookiesToSearch.find(c => c.name === dc.name)) {
+                      cookiesToSearch.push(dc)
+                    }
+                  }
+                } catch (e) {
+                  console.log(`[InAppLogin] Error getting cookies for domain ${domain}:`, e)
+                }
+              }
+              const allCookiesObj: Record<string, string> = {}
+              for (const c of cookiesToSearch) {
+                if (c.value) {
+                  allCookiesObj[c.name] = c.value
+                }
+              }
+              this.emit('tokenFound', { key: source.key, value: cookie.value, allCookies: allCookiesObj })
+            } catch (e) {
+              console.log('[InAppLogin] Error collecting cookies on cookie changed:', e)
+              this.emit('tokenFound', { key: source.key, value: cookie.value })
+            }
           } else {
             console.log('[InAppLogin] Cookie token is invalid:', cookie.value ? cookie.value.substring(0, 50) : 'null')
           }
@@ -537,14 +566,37 @@ export class InAppLoginManager extends EventEmitter {
       return
     }
 
+    if (this.tokenCheckRunning) {
+      // A previous check is still in flight (e.g. waiting on a hung
+      // executeJavaScript); re-queue a single retry so cookie changes
+      // arriving during the in-flight check are not missed.
+      if (!this.tokenCheckQueued) {
+        this.tokenCheckQueued = true
+        setTimeout(() => {
+          this.tokenCheckQueued = false
+          if (!this.isCompleted) void this.checkForTokens()
+        }, 600)
+      }
+      return
+    }
+    this.tokenCheckRunning = true
+
     const localStorageSources = this.config.tokenSources.filter((s) => s.type === 'localStorage')
     const cookieSources = this.config.tokenSources.filter((s) => s.type === 'cookie')
 
-    if (localStorageSources.length === 0 && cookieSources.length === 0) return
+    if (localStorageSources.length === 0 && cookieSources.length === 0) {
+      this.tokenCheckRunning = false
+      return
+    }
 
     console.log('[InAppLogin] Checking tokens, localStorage:', localStorageSources.map(s => s.key), 'cookies:', cookieSources.map(s => s.key))
 
     try {
+      // Cookie sources use pure Electron APIs (no page JavaScript), so they
+      // still work when the renderer main thread is blocked by anti-bot
+      // scripts. Check them BEFORE probing localStorage.
+      await this.checkCookieTokens(cookieSources)
+
       for (const source of localStorageSources) {
         if (webContents.isDestroyed() || this.isCompleted) {
           console.log('[InAppLogin] webContents destroyed or login completed, stopping token check')
@@ -562,7 +614,7 @@ export class InAppLoginManager extends EventEmitter {
             }
           })()
         `
-        const value = await webContents.executeJavaScript(script)
+        const value = await this.executeWithTimeout<string>(webContents, script, 3000)
         console.log('[InAppLogin] Got value from localStorage:', source.key, value ? value.substring(0, 50) + '...' : 'null')
 
         if (source.key === 'user_detail_agent' && value) {
@@ -597,60 +649,117 @@ export class InAppLoginManager extends EventEmitter {
           console.log('[InAppLogin] Token found and valid from localStorage:', source.key)
           const emitKey = source.key === '_token' ? 'token' : source.key
           this.foundTokens.set(emitKey, tokenValue)
-          this.emit('tokenFound', { key: emitKey, value: tokenValue })
-        }
-      }
 
-      for (const source of cookieSources) {
-        if (!this.loginSession) continue
-
-        const allCookies = await this.loginSession.cookies.get({})
-        console.log('[InAppLogin] All cookies count:', allCookies.length)
-        console.log('[InAppLogin] All cookies:', allCookies.map(c => `${c.name}=${c.value?.substring(0, 20)}...`))
-        
-        const targetDomains = this.config?.targetDomains || []
-        let cookiesToSearch = allCookies
-        
-        for (const domain of targetDomains) {
-          try {
-            const domainCookies = await this.loginSession.cookies.get({ domain })
-            console.log(`[InAppLogin] Domain cookies for ${domain}:`, domainCookies.map(c => c.name))
-            for (const dc of domainCookies) {
-              if (!cookiesToSearch.find(c => c.name === dc.name)) {
-                cookiesToSearch.push(dc)
+          // For providers that need cookies (e.g. Qwen AI), collect all browser
+          // cookies and attach them to the tokenFound event so the manager can
+          // pass them to validateToken alongside the token.
+          if (this.loginSession) {
+            try {
+              const allBrowserCookies = await this.loginSession.cookies.get({})
+              const targetDomains = this.config?.targetDomains || []
+              let cookiesToSearch = allBrowserCookies
+              for (const domain of targetDomains) {
+                try {
+                  const domainCookies = await this.loginSession.cookies.get({ domain })
+                  for (const dc of domainCookies) {
+                    if (!cookiesToSearch.find(c => c.name === dc.name)) {
+                      cookiesToSearch.push(dc)
+                    }
+                  }
+                } catch (e) {
+                  console.log(`[InAppLogin] Error getting cookies for domain ${domain}:`, e)
+                }
               }
-            }
-          } catch (e) {
-            console.log(`[InAppLogin] Error getting cookies for domain ${domain}:`, e)
-          }
-        }
-        
-        console.log('[InAppLogin] Combined cookies to search:', cookiesToSearch.map(c => c.name))
-
-        const cookie = cookiesToSearch.find(c => c.name === source.key)
-        if (cookie) {
-          console.log('[InAppLogin] Found cookie:', source.key, cookie.value ? cookie.value.substring(0, 50) + '...' : 'null')
-
-          if (cookie.value && this.isValidToken(cookie.value)) {
-            console.log('[InAppLogin] Token found and valid from cookie:', source.key, 'emitting tokenFound event')
-            const allCookiesObj: Record<string, string> = {}
-            for (const c of cookiesToSearch) {
-              if (c.value) {
-                allCookiesObj[c.name] = c.value
+              const allCookiesObj: Record<string, string> = {}
+              for (const c of cookiesToSearch) {
+                if (c.value) {
+                  allCookiesObj[c.name] = c.value
+                }
               }
+              console.log('[InAppLogin] Attaching allCookies to localStorage tokenFound:', Object.keys(allCookiesObj).length, 'cookies')
+              this.emit('tokenFound', { key: emitKey, value: tokenValue, allCookies: allCookiesObj })
+            } catch (e) {
+              console.log('[InAppLogin] Error collecting cookies for localStorage token:', e)
+              this.emit('tokenFound', { key: emitKey, value: tokenValue })
             }
-            this.foundTokens.set(source.key, cookie.value)
-            this.emit('tokenFound', { key: source.key, value: cookie.value, allCookies: allCookiesObj })
           } else {
-            console.log('[InAppLogin] Cookie token is invalid:', source.key, cookie.value ? cookie.value.substring(0, 50) : 'null')
+            this.emit('tokenFound', { key: emitKey, value: tokenValue })
           }
-        } else {
-          console.log('[InAppLogin] Cookie not found:', source.key)
         }
       }
+
     } catch (error) {
       console.error('[InAppLogin] Error in checkForTokens:', error)
+    } finally {
+      this.tokenCheckRunning = false
     }
+  }
+
+  /**
+   * Cookie-based token sources checked via pure Electron APIs (no page
+   * JavaScript involved), so this works even when the renderer main thread
+   * is blocked (e.g. by the Baxia WAF punish page inside the login window).
+   */
+  private async checkCookieTokens(cookieSources: TokenSource[]): Promise<void> {
+    if (cookieSources.length === 0 || !this.loginSession) return
+
+    const allCookies = await this.loginSession.cookies.get({})
+    console.log('[InAppLogin] All cookies count:', allCookies.length)
+
+    const targetDomains = this.config?.targetDomains || []
+    let cookiesToSearch = allCookies
+
+    for (const domain of targetDomains) {
+      try {
+        const domainCookies = await this.loginSession.cookies.get({ domain })
+        for (const dc of domainCookies) {
+          if (!cookiesToSearch.find((c) => c.name === dc.name)) {
+            cookiesToSearch.push(dc)
+          }
+        }
+      } catch (e) {
+        console.log(`[InAppLogin] Error getting cookies for domain ${domain}:`, e)
+      }
+    }
+
+    for (const source of cookieSources) {
+      const cookie = cookiesToSearch.find((c) => c.name === source.key)
+      if (!cookie) {
+        console.log('[InAppLogin] Cookie not found:', source.key)
+        continue
+      }
+
+      console.log('[InAppLogin] Found cookie:', source.key, cookie.value ? cookie.value.substring(0, 50) + '...' : 'null')
+      if (cookie.value && this.isValidToken(cookie.value)) {
+        console.log('[InAppLogin] Token found and valid from cookie:', source.key, 'emitting tokenFound event')
+        const allCookiesObj: Record<string, string> = {}
+        for (const c of cookiesToSearch) {
+          if (c.value) {
+            allCookiesObj[c.name] = c.value
+          }
+        }
+        this.foundTokens.set(source.key, cookie.value)
+        this.emit('tokenFound', { key: source.key, value: cookie.value, allCookies: allCookiesObj })
+      } else {
+        console.log('[InAppLogin] Cookie token is invalid:', source.key, cookie.value ? cookie.value.substring(0, 50) : 'null')
+      }
+    }
+  }
+
+  /**
+   * executeJavaScript hangs forever when the renderer main thread is blocked
+   * (anti-bot/WAF scripts). Bound it with a timeout so token checks keep
+   * making progress via the cookie branch.
+   */
+  private async executeWithTimeout<T>(
+    webContents: WebContents,
+    script: string,
+    timeoutMs: number
+  ): Promise<T | null> {
+    return Promise.race([
+      webContents.executeJavaScript(script) as Promise<T>,
+      new Promise<T | null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+    ])
   }
 
   completeWithSuccess(
