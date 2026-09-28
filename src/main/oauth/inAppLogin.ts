@@ -11,6 +11,15 @@ import { TokenExtractionConfig, getTokenExtractionConfig, TokenSource } from './
 export interface InAppLoginResult {
   success: boolean
   credentials?: Record<string, string>
+  accountInfo?: {
+    userId?: string
+    email?: string
+    name?: string
+    avatar?: string
+    quota?: number
+    used?: number
+    expiresAt?: number
+  }
   error?: string
 }
 
@@ -644,10 +653,14 @@ export class InAppLoginManager extends EventEmitter {
     }
   }
 
-  completeWithSuccess(credentials: Record<string, string>): void {
+  completeWithSuccess(
+    credentials: Record<string, string>,
+    accountInfo?: InAppLoginResult['accountInfo'],
+  ): void {
     this.complete({
       success: true,
       credentials,
+      accountInfo,
     })
   }
 

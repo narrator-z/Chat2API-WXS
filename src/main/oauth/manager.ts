@@ -297,7 +297,7 @@ export class OAuthManager extends EventEmitter {
         })
       }
 
-      const completeHandler = (result: { success: boolean; credentials?: Record<string, string>; error?: string }) => {
+      const completeHandler = (result: { success: boolean; credentials?: Record<string, string>; accountInfo?: InAppLoginResult['accountInfo']; error?: string }) => {
         inAppLoginManager.off('status', statusHandler)
         inAppLoginManager.off('tokenFound', tokenFoundHandler)
         inAppLoginManager.off('complete', completeHandler)
@@ -313,6 +313,7 @@ export class OAuthManager extends EventEmitter {
             providerId,
             providerType,
             credentials: result.credentials,
+            accountInfo: result.accountInfo,
           })
         } else {
           this.emit('statusChange', 'error')
@@ -558,7 +559,7 @@ export class OAuthManager extends EventEmitter {
 
           if (validation.valid) {
             console.log('[OAuthManager] Token is valid, completing login with credentials:', JSON.stringify(finalCredentials, null, 2))
-            inAppLoginManager.completeWithSuccess(finalCredentials)
+            inAppLoginManager.completeWithSuccess(finalCredentials, validation.accountInfo)
           } else {
             console.log('[OAuthManager] Token validation failed:', validation.error)
             this.sendProgressToRenderer({
