@@ -2,7 +2,7 @@
 
 本项目的所有重要变更都会记录在此文件中。
 
-## [未发布]
+## [1.6.6] - 2026-09-28
 
 ### ✨ 新功能 (Features)
 
@@ -12,6 +12,7 @@
 
 - 修复多模态图片输入导致的 `[object Object]` 与内容丢失问题：新增共享内容归一化工具 `utils/messageContent.ts`，Qwen AI/Kimi/MiniMax/Z.ai/DeepSeek/GLM 等适配器不再对数组型 `content` 直接字符串化；不支持图片输入的纯文本通道（Qwen AI、Kimi、MiniMax、Z.ai、Perplexity、Mimo）现在会向模型附加明确的"图片已省略"提示，而不是静默丢弃
 - 修复 `streamToolHandler.ts` 从 `toolParser/index.ts` 导入不存在符号 `createBaseChunk` 的问题（Vite 打包时被掩盖，Node ESM 直接加载会抛错）；`parseToolCallsFromText` 的导入统一指向正确的 `utils/toolParser.ts`
+- 修复应用内 OAuth 登录后账号信息（名称、邮箱、userId）不自动填充：`InAppLoginResult` 接口缺少 `accountInfo` 字段，`completeWithSuccess` 调用时未透传 `validation.accountInfo`，导致前端 `AddAccountDialog` 拿到的 `OAuthResult.accountInfo` 恒为 `undefined`。该修复惠及所有使用应用内登录的 provider（qwen-ai、kimi、minimax、mimo、deepseek、glm、zai、perplexity）
 
 ## [1.6.5] - 2026-08-31
 
