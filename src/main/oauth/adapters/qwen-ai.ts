@@ -107,9 +107,12 @@ export class QwenAiAdapter extends BaseOAuthAdapter {
         
         if (payload && (payload.sub || payload.id || payload.user_id || payload.uid)) {
           const userId = payload.sub || payload.id || payload.user_id || payload.uid
+          const cookies = typeof credentials.cookies === 'string' ? JSON.parse(credentials.cookies) : credentials.cookies
+          
+          console.log('[QwenAi OAuth] JWT payload keys:', Object.keys(payload), 'userId:', userId, 'has cookies:', !!cookies)
           
           try {
-            const userInfo = await this.getUserInfo(token)
+            const userInfo = await this.getUserInfo(token, cookies)
             console.log('[QwenAi OAuth] User info:', userInfo)
             
             if (userInfo && userInfo.is_guest === true) {
@@ -155,23 +158,33 @@ export class QwenAiAdapter extends BaseOAuthAdapter {
     }
   }
 
-  async getUserInfo(token: string): Promise<Record<string, unknown> | null> {
+  async getUserInfo(token: string, cookies?: Record<string, string>): Promise<Record<string, unknown> | null> {
     try {
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${token}`,
+        ...FAKE_HEADERS,
+      }
+      if (cookies && Object.keys(cookies).length > 0) {
+        headers.Cookie = Object.entries(cookies)
+          .map(([k, v]) => `${k}=${v}`)
+          .join('; ')
+      }
       const response = await axios.get(`${QWEN_AI_API_BASE}/api/v2/user/info`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          ...FAKE_HEADERS,
-        },
+        headers,
         timeout: 15000,
         validateStatus: () => true,
       })
       
+      console.log('[QwenAi OAuth] getUserInfo response status:', response.status, 'data.success:', response.data?.success)
+      
       if (response.status !== 200 || !response.data?.success) {
+        console.log('[QwenAi OAuth] getUserInfo failed, status:', response.status, 'response:', JSON.stringify(response.data).substring(0, 300))
         return null
       }
       
       return response.data.data
-    } catch {
+    } catch (error) {
+      console.log('[QwenAi OAuth] getUserInfo error:', error instanceof Error ? error.message : error)
       return null
     }
   }
