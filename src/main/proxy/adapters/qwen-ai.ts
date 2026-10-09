@@ -13,6 +13,7 @@ import {
   extractQwenAiRefreshToken,
   isQwenAiTokenExpiring,
   refreshQwenAiToken,
+  normalizeCookies,
   replaceRefreshTokenCookie,
 } from '../../lib/qwenAiAuth'
 import { hasToolUse, parseToolUse, ToolCall } from '../promptToolUse'
@@ -271,7 +272,9 @@ export class QwenAiAdapter {
 
   private getCookies(): string {
     const credentials = this.account.credentials
-    return credentials.cookies || credentials.cookie || ''
+    // In-app login may store cookies as a name -> value object; normalize to a
+    // Cookie header string so downstream string ops (split/match) never throw.
+    return normalizeCookies((credentials as Record<string, unknown>).cookies ?? (credentials as Record<string, unknown>).cookie)
   }
 
   private getHeaders(chatId?: string): Record<string, string> {

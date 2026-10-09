@@ -25,10 +25,34 @@ export interface QwenAiTokenPair {
   refreshToken: string
 }
 
-/** Pull `refresh_token` out of credentials (explicit field or cookie string). */
+/**
+ * Normalize the stored cookies credential into a Cookie header string.
+ * In-app login collects cookies as a name -> value object; HAR/manual imports
+ * may store a raw Cookie header string. Both shapes must work here.
+ */
+export function normalizeCookies(cookies: unknown): string {
+  if (!cookies) return ''
+  if (typeof cookies === 'string') return cookies
+  if (typeof cookies === 'object') {
+    return Object.entries(cookies as Record<string, unknown>)
+      .filter(([, v]) => typeof v === 'string')
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ')
+  }
+  return String(cookies)
+}
+
+/** Pull `refresh_token` out of credentials (explicit field, cookie object or cookie string). */
 export function extractQwenAiRefreshToken(credentials: Record<string, string>): string {
   if (credentials.refresh_token) return credentials.refresh_token
-  const cookies = credentials.cookies || credentials.cookie || ''
+  // In-app login stores cookies as an object { refresh_token: '...' }; HAR/manual
+  // imports store a raw cookie header string. Handle both shapes.
+  const rawCookies = (credentials as Record<string, unknown>).cookies ?? (credentials as Record<string, unknown>).cookie
+  if (rawCookies && typeof rawCookies === 'object') {
+    const token = (rawCookies as Record<string, unknown>).refresh_token
+    if (typeof token === 'string' && token) return token
+  }
+  const cookies = normalizeCookies(rawCookies)
   const match = cookies.match(/(?:^|;\s*)refresh_token=([^;]+)/)
   return match ? match[1] : ''
 }
@@ -36,10 +60,11 @@ export function extractQwenAiRefreshToken(credentials: Record<string, string>): 
 /** Replace (or append) the refresh_token cookie inside a cookie string. */
 export function replaceRefreshTokenCookie(cookies: string, refreshToken: string): string {
   if (!refreshToken) return cookies
-  if (/(?:^|;\s*)refresh_token=/.test(cookies)) {
-    return cookies.replace(/((?:^|;\s*)refresh_token=)[^;]+/, `$1${refreshToken}`)
+  const normalized = normalizeCookies(cookies)
+  if (/(?:^|;\s*)refresh_token=/.test(normalized)) {
+    return normalized.replace(/((?:^|;\s*)refresh_token=)[^;]+/, `$1${refreshToken}`)
   }
-  return cookies ? `${cookies}; refresh_token=${refreshToken}` : `refresh_token=${refreshToken}`
+  return normalized ? `${normalized}; refresh_token=${refreshToken}` : `refresh_token=${refreshToken}`
 }
 
 /** Decode the `exp` claim (seconds) from a JWT, or null when unreadable. */

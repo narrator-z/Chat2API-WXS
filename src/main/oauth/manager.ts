@@ -336,8 +336,19 @@ export class OAuthManager extends EventEmitter {
         
         // Store all cookies if provided (needed for Cloudflare-protected requests)
         if (event.allCookies) {
-          collectedTokens['cookies'] = event.allCookies as any
-          console.log('[OAuthManager] Stored all cookies:', Object.keys(event.allCookies).length, 'cookies')
+          // Qwen AI consumes cookies as a Cookie-header string (proxy adapter,
+          // refresh helpers, safeStorage encryption of each credential field);
+          // store it serialized. Other providers (e.g. Perplexity) expect the
+          // raw name -> value object.
+          if (providerType === 'qwen-ai') {
+            collectedTokens['cookies'] = Object.entries(event.allCookies)
+              .map(([name, value]) => `${name}=${value}`)
+              .join('; ')
+            console.log('[OAuthManager] Stored qwen-ai cookies as header string:', Object.keys(event.allCookies).length, 'cookies')
+          } else {
+            collectedTokens['cookies'] = event.allCookies as any
+            console.log('[OAuthManager] Stored all cookies:', Object.keys(event.allCookies).length, 'cookies')
+          }
         }
         
         console.log('[OAuthManager] Collected tokens:', Object.keys(collectedTokens))

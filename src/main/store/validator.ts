@@ -380,12 +380,16 @@ class GenericTokenValidator implements Validator {
  */
 export async function validateCredentials(
   provider: Provider,
-  credentials: Record<string, string>
+  credentials: Record<string, string>,
+  accountId?: string
 ): Promise<ValidationResult> {
   // Built-in providers use ProviderChecker for validation
   if (provider.type === 'builtin') {
     const tempAccount = {
-      id: 'temp',
+      // Pass the real account id so checkers (e.g. Qwen AI token refresh)
+      // can persist rotated credentials back to the store. Falls back to
+      // 'temp' for pre-creation validations where nothing should be written.
+      id: accountId || 'temp',
       providerId: provider.id,
       name: 'temp',
       credentials,

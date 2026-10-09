@@ -567,10 +567,19 @@ export class ProviderChecker {
             ),
           }
           account.credentials = updatedCredentials
-          try {
-            storeManager.updateAccount(account.id, { credentials: { ...updatedCredentials } })
-          } catch (error) {
-            console.error('[QwenAI] Checker failed to persist refreshed token:', error)
+          if (account.id === 'temp') {
+            console.warn(
+              '[QwenAI] Checker refreshed token but account id is "temp" — rotated refresh_token was NOT persisted. Pass the real account id to validateCredentials().'
+            )
+          } else {
+            try {
+              const persisted = storeManager.updateAccount(account.id, { credentials: { ...updatedCredentials } })
+              if (!persisted) {
+                console.error('[QwenAI] Checker failed to persist refreshed token: account not found:', account.id)
+              }
+            } catch (error) {
+              console.error('[QwenAI] Checker failed to persist refreshed token:', error)
+            }
           }
         }
       }

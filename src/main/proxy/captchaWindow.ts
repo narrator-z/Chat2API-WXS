@@ -14,6 +14,7 @@
 import { BrowserWindow, session } from 'electron'
 import type { Session, WebFrameMain } from 'electron'
 import { AccountManager } from '../store/accounts'
+import { normalizeCookies } from '../lib/qwenAiAuth'
 
 const PARTITION = 'persist:qwen-ai-captcha'
 const PUNISH_URL_RE = /_____tmd_____|\bpunish\b/
@@ -44,7 +45,12 @@ async function runCaptchaWindow(accountId: string, punishUrl: string): Promise<s
   }
 
   const sess = session.fromPartition(PARTITION)
-  const existingCookies = account.credentials.cookies || account.credentials.cookie || ''
+  // Legacy in-app-login accounts may store cookies as a name -> value object;
+  // normalize to a Cookie header string before seeding/merging.
+  const existingCookies = normalizeCookies(
+    (account.credentials as Record<string, unknown>).cookies ??
+      (account.credentials as Record<string, unknown>).cookie
+  )
   await seedCookies(sess, existingCookies)
 
   const win = new BrowserWindow({

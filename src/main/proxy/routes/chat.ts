@@ -153,14 +153,36 @@ router.post('/completions', async (ctx: Context) => {
 
   if (!selection) {
     ctx.status = 503
+    const errorMessage = `No available account for model: ${request.model}`
     ctx.body = {
       error: {
-        message: `No available account for model: ${request.model}`,
+        message: errorMessage,
         type: 'service_unavailable_error',
         param: null,
         code: 'no_available_account',
       },
     }
+
+    // Log rejected requests too — otherwise callers see a failure but the
+    // request log UI stays empty (e.g. all accounts marked 'error').
+    storeManager.addRequestLog({
+      timestamp: startTime,
+      status: 'error',
+      statusCode: 503,
+      method: 'POST',
+      url: '/v1/chat/completions',
+      model: request.model,
+      requestBody: JSON.stringify(request),
+      userInput: extractUserInput(request.messages),
+      webSearch: request.web_search,
+      reasoningEffort: request.reasoning_effort,
+      responseStatus: 503,
+      responseBody: JSON.stringify(ctx.body),
+      latency: Date.now() - startTime,
+      isStream: request.stream || false,
+      errorMessage,
+    })
+    storeManager.addLog('warn', errorMessage, { requestId, model: request.model, clientIP })
     return
   }
 
@@ -192,14 +214,38 @@ router.post('/completions', async (ctx: Context) => {
     } else {
       ctx.status = 429
       ctx.set('Retry-After', '5')
+      const errorMessage = 'All accounts for this model are busy, please retry shortly'
       ctx.body = {
         error: {
-          message: 'All accounts for this model are busy, please retry shortly',
+          message: errorMessage,
           type: 'rate_limit_error',
           param: null,
           code: 'account_busy',
         },
       }
+      storeManager.addRequestLog({
+        timestamp: startTime,
+        status: 'error',
+        statusCode: 429,
+        method: 'POST',
+        url: '/v1/chat/completions',
+        model: request.model,
+        actualModel,
+        providerId: provider.id,
+        providerName: provider.name,
+        accountId: account.id,
+        accountName: account.name,
+        requestBody: JSON.stringify(request),
+        userInput: extractUserInput(request.messages),
+        webSearch: request.web_search,
+        reasoningEffort: request.reasoning_effort,
+        responseStatus: 429,
+        responseBody: JSON.stringify(ctx.body),
+        latency: Date.now() - startTime,
+        isStream: request.stream || false,
+        errorMessage,
+      })
+      storeManager.addLog('warn', errorMessage, { requestId, model: request.model, accountId: account.id })
     }
     return
   }
