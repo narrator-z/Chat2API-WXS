@@ -7,7 +7,7 @@
     "name": "Chat2API Team",
     "email": "support@chat2api.com"
   },
-  "homepage": "https://github.com/wxs0625/Chat2API-WXS",
+  "homepage": "https://github.com/narrator-z/Chat2API-WXS",
   "license": "GPL-3.0",
   "scripts": {
     "dev": "bash scripts/dev.sh",
@@ -243,7 +243,7 @@
     },
     "publish": {
       "provider": "github",
-      "owner": "wxs0625",
+      "owner": "narrator-z",
       "repo": "Chat2API-WXS",
       "releaseType": "release"
     }
