@@ -47,6 +47,10 @@ export const IpcChannels = {
   ACCOUNTS_GET_CREDITS: 'accounts:getCredits',
   ACCOUNTS_CLEAR_CHATS: 'accounts:clearChats',
   ACCOUNTS_STATUS_CHANGED: 'accounts:statusChanged',
+  ACCOUNTS_BATCH_VALIDATE: 'accounts:batchValidate',
+  ACCOUNTS_BATCH_VALIDATE_PROGRESS: 'accounts:batchValidateProgress',
+  ACCOUNTS_REMOVED: 'accounts:removed',
+  ACCOUNTS_REFILL_NEEDED: 'accounts:refillNeeded',
 
   OAUTH_START_LOGIN: 'oauth:startLogin',
   OAUTH_CANCEL_LOGIN: 'oauth:cancelLogin',
@@ -59,6 +63,20 @@ export const IpcChannels = {
   OAUTH_START_IN_APP_LOGIN: 'oauth:startInAppLogin',
   OAUTH_CANCEL_IN_APP_LOGIN: 'oauth:cancelInAppLogin',
   OAUTH_IN_APP_LOGIN_STATUS: 'oauth:inAppLoginStatus',
+
+  TEMP_MAIL_GET_CONFIG: 'tempMail:getConfig',
+  TEMP_MAIL_UPDATE_CONFIG: 'tempMail:updateConfig',
+  TEMP_MAIL_TEST: 'tempMail:test',
+  TEMP_MAIL_IS_CONFIGURED: 'tempMail:isConfigured',
+
+  GEEPASS_GET_CONFIG: 'geepass:getConfig',
+  GEEPASS_UPDATE_CONFIG: 'geepass:updateConfig',
+  GEEPASS_TEST: 'geepass:test',
+
+  UPSTREAM_PROXY_GET_CONFIG: 'upstreamProxy:getConfig',
+  UPSTREAM_PROXY_UPDATE_CONFIG: 'upstreamProxy:updateConfig',
+  UPSTREAM_PROXY_TEST: 'upstreamProxy:test',
+  UPSTREAM_PROXY_PARSE_SUBSCRIPTION: 'upstreamProxy:parseSubscription',
 
   LOGS_GET: 'logs:get',
   LOGS_GET_STATS: 'logs:getStats',

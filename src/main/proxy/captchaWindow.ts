@@ -15,6 +15,9 @@ import { BrowserWindow, session } from 'electron'
 import type { Session, WebFrameMain } from 'electron'
 import { AccountManager } from '../store/accounts'
 import { normalizeCookies } from '../lib/qwenAiAuth'
+import { isGeepassEnabled } from '../lib/geepass'
+import { dragHandle, locatePuzzle, solvePuzzle } from '../lib/puzzleSolver'
+import { applySessionProxy } from '../lib/clashProxy'
 
 const PARTITION = 'persist:qwen-ai-captcha'
 const PUNISH_URL_RE = /_____tmd_____|\bpunish\b/
@@ -45,6 +48,13 @@ async function runCaptchaWindow(accountId: string, punishUrl: string): Promise<s
   }
 
   const sess = session.fromPartition(PARTITION)
+  // Route the captcha window through the configured upstream proxy (Clash etc.)
+  // so the verification happens from the same egress IP as the API requests.
+  try {
+    await applySessionProxy(sess)
+  } catch (error) {
+    console.warn('[QwenCaptcha] Failed to apply upstream proxy:', error)
+  }
   // Legacy in-app-login accounts may store cookies as a name -> value object;
   // normalize to a Cookie header string before seeding/merging.
   const existingCookies = normalizeCookies(
@@ -335,78 +345,29 @@ async function locateSlider(win: BrowserWindow): Promise<SliderGeometry | null> 
   return walk(win.webContents.mainFrame, 0, 0)
 }
 
+// ==================== Puzzle captcha (Geepass) ====================
+// Puzzle probing / locating / dragging now lives in lib/puzzleSolver so the
+// registration flow (oauth/qwenRegister.ts) can reuse the same solver.
+
 /**
- * Generate a human-like drag trajectory: cubic ease-out toward the end,
- * slight overshoot past the target then small corrections back, with
- * y-axis jitter. NoCaptcha scores the movement curve, so straight-line
- * constant-speed drags are rejected.
+ * Solve the puzzle slider via Geepass (shared solver): recognize the gap X
+ * in background image pixels, scale to DOM pixels, and drag the handle that
+ * distance. Returns true when the captcha reported success afterwards.
  */
-function humanTrajectory(distance: number): Array<{ dx: number; dy: number }> {
-  const points: Array<{ dx: number; dy: number }> = []
-  const steps = 45 + Math.floor(Math.random() * 30)
-  const overshoot = Math.min(12, 3 + Math.random() * 5 + distance * 0.015)
-  let yDrift = 0
-
-  for (let i = 1; i <= steps; i++) {
-    const t = i / steps
-    const eased = 1 - Math.pow(1 - t, 3)
-    const dx = eased * (distance + overshoot)
-    yDrift += (Math.random() - 0.5) * 0.9
-    yDrift = Math.max(-2.5, Math.min(2.5, yDrift))
-    points.push({ dx, dy: yDrift })
-  }
-
-  // Correct back from the overshoot in a few small moves.
-  const corrSteps = 4 + Math.floor(Math.random() * 4)
-  for (let i = 1; i <= corrSteps; i++) {
-    const t = i / corrSteps
-    points.push({
-      dx: distance + overshoot * (1 - t) + (Math.random() - 0.5) * 0.6,
-      dy: yDrift * (1 - t),
-    })
-  }
-  points.push({ dx: distance, dy: 0 })
-  return points
-}
-
-/** Drag the slider handle with synthetic-but-trusted input events. */
-async function dragSlider(win: BrowserWindow, geo: SliderGeometry): Promise<void> {
-  const distance = Math.max(20, geo.trackWidth - geo.handleWidth - 1)
-  const startX = Math.round(geo.x)
-  const startY = Math.round(geo.y)
-  const webContents = win.webContents
-
-  // Approach the handle first, then press down after a short dwell.
-  webContents.sendInputEvent({ type: 'mouseMove', x: startX, y: startY + 30, clickCount: 0 })
-  await sleep(80 + Math.random() * 120)
-  webContents.sendInputEvent({ type: 'mouseMove', x: startX, y: startY, clickCount: 0 })
-  await sleep(120 + Math.random() * 200)
-  webContents.sendInputEvent({ type: 'mouseDown', x: startX, y: startY, button: 'left', clickCount: 1 })
-  await sleep(60 + Math.random() * 120)
-
-  const trajectory = humanTrajectory(distance)
-  for (let i = 0; i < trajectory.length; i++) {
-    if (win.isDestroyed()) return
-    const { dx, dy } = trajectory[i]
-    webContents.sendInputEvent({
-      type: 'mouseMove',
-      x: Math.round(startX + dx),
-      y: Math.round(startY + dy),
-      clickCount: 0,
-    })
-    // Variable cadence with occasional micro-pauses.
-    await sleep(6 + Math.random() * 14)
-    if (Math.random() < 0.04) await sleep(40 + Math.random() * 60)
-  }
-
-  // Hold briefly at the end before releasing (humans don't snap-release).
-  await sleep(80 + Math.random() * 150)
-  webContents.sendInputEvent({
-    type: 'mouseUp',
-    x: Math.round(startX + distance),
-    y: startY,
-    button: 'left',
-    clickCount: 1,
+async function attemptGeepassSolve(win: BrowserWindow): Promise<boolean> {
+  return solvePuzzle(win.webContents, {
+    onStatus: (msg) => void setBarStatus(win, msg),
+    verifySolved: async () => {
+      await sleep(1800 + Math.random() * 900)
+      if (win.isDestroyed()) return true
+      try {
+        const state = await win.webContents.executeJavaScript(pollStateScript())
+        return !!(state?.successText || state?.done)
+      } catch {
+        // Page navigating after success; let the poll timer decide.
+        return false
+      }
+    },
   })
 }
 
@@ -426,12 +387,37 @@ async function setBarStatus(win: BrowserWindow, message: string): Promise<void> 
  * Full auto-slide flow: wait for the slider to appear, drag it, verify via
  * the state poll script, retry up to 3 times. Returns true when the captcha
  * reported success (the poll timer then finishes the window normally).
+ *
+ * When Geepass is configured and a puzzle-style slider (canvas background +
+ * gap) is detected, the gap position is recognized through Geepass and the
+ * handle is dragged exactly to the gap instead of the NoCaptcha drag-to-end
+ * heuristic (which only works for "slide all the way" captchas).
  */
 async function attemptAutoSlide(win: BrowserWindow): Promise<boolean> {
+  const geepassOn = isGeepassEnabled()
+
   // Wait up to ~20s for the slider to render.
   let geo: SliderGeometry | null = null
+  let puzzleTried = false
   for (let i = 0; i < 40; i++) {
     if (win.isDestroyed()) return false
+
+    // Puzzle branch first: the Aliyun punish page shows a canvas puzzle with
+    // a gap; the NoCaptcha probe may also match its handle, so check puzzle
+    // before falling back to the drag-to-end heuristic.
+    if (geepassOn && !puzzleTried) {
+      const puzzle = await locatePuzzle(win.webContents)
+      if (puzzle) {
+        puzzleTried = true
+        console.log('[QwenCaptcha] Puzzle slider detected, using Geepass recognition')
+        const ok = await attemptGeepassSolve(win)
+        if (ok) return true
+        if (win.isDestroyed()) return false
+        // Fall through to the NoCaptcha heuristic below as a last resort.
+        void setBarStatus(win, 'Geepass 未通过，尝试普通自动滑动…也可手动拖动')
+      }
+    }
+
     geo = await locateSlider(win)
     if (geo) break
     await sleep(500)
@@ -448,7 +434,7 @@ async function attemptAutoSlide(win: BrowserWindow): Promise<boolean> {
 
     await sleep(400 + Math.random() * 600)
     const fresh = attempt === 1 ? geo : (await locateSlider(win)) || geo
-    await dragSlider(win, fresh)
+    await dragHandle(win.webContents, fresh)
 
     // Give NoCaptcha time to validate the trajectory server-side.
     await sleep(1800 + Math.random() * 1000)

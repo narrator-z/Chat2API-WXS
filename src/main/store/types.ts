@@ -3,7 +3,7 @@
  * Defines core data structures for accounts, providers, and configuration
  */
 
-import type { ProviderStatus } from '../../shared/types'
+import type { ProviderStatus, TempMailConfig, GeepassConfig, UpstreamProxyConfig } from '../../shared/types'
 import type { LegacyToolPromptConfig, ToolCallingConfig } from '../../shared/toolCalling.ts'
 import { DEFAULT_TOOL_CALLING_CONFIG } from '../../shared/toolCalling.ts'
 
@@ -248,6 +248,24 @@ export interface AppConfig {
   maxConcurrentPerAccount: number
   /** How long (ms) a request may wait for a free account slot before 429 */
   accountBusyTimeoutMs: number
+  /** Delay (seconds) between two consecutive accounts in a batch registration */
+  registerIntervalSeconds?: number
+  /** Periodically validate all accounts in the background */
+  autoCheckAccounts?: boolean
+  /** Interval (minutes) between automatic account validations */
+  autoCheckAccountsIntervalMinutes?: number
+  /** Automatically delete accounts that fail validation */
+  autoDeleteBadAccounts?: boolean
+  /** Automatically register replacement accounts after bad ones were auto-deleted */
+  autoRefillAccounts?: boolean
+  /** Target number of accounts per provider (0 = disabled); below it, new accounts are auto-registered */
+  targetAccountCount?: number
+  /** Temporary mailbox settings for the Qwen AI auto-registration flow */
+  tempMail?: TempMailConfig
+  /** Geepass captcha-recognition settings used by the captcha window */
+  geepass?: GeepassConfig
+  /** Upstream proxy settings (manual URL or Clash subscription auto-detect) */
+  upstreamProxy?: UpstreamProxyConfig
 }
 
 /**
@@ -591,6 +609,13 @@ export interface ValidationResult {
   valid: boolean
   /** Error message */
   error?: string
+  /**
+   * True when the failure was caused by a connection-level problem
+   * (DNS failure, timeout, refused connection) instead of invalid
+   * credentials. Such failures must NOT trigger auto-deletion or
+   * status downgrades — they are transient.
+   */
+  networkError?: boolean
   /** Validation time */
   validatedAt: number
   /** Account info (returned when validation succeeds) */
@@ -868,6 +893,15 @@ export const DEFAULT_CONFIG: AppConfig = {
   autoUpdateModelsIntervalHours: 24,
   maxConcurrentPerAccount: 1,
   accountBusyTimeoutMs: 30000,
+  registerIntervalSeconds: 10,
+  autoCheckAccounts: false,
+  autoCheckAccountsIntervalMinutes: 30,
+  autoDeleteBadAccounts: false,
+  autoRefillAccounts: false,
+  targetAccountCount: 0,
+  tempMail: undefined,
+  geepass: { enabled: false, token: '', type: 20110 },
+  upstreamProxy: { enabled: false, source: 'clash' },
 }
 
 /**

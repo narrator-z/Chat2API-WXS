@@ -7,6 +7,8 @@ import { BrowserWindow, session, Session, WebContents } from 'electron'
 import { EventEmitter } from 'events'
 import { ProviderType } from './types'
 import { TokenExtractionConfig, getTokenExtractionConfig, TokenSource } from './tokenExtractionConfig'
+import { runQwenRegistration, QWEN_REGISTER_URL } from './qwenRegister'
+import { applySessionProxy } from '../lib/clashProxy'
 
 export interface InAppLoginResult {
   success: boolean
@@ -34,12 +36,20 @@ export interface InAppLoginOptions {
   providerType: ProviderType
   timeout?: number
   proxyMode?: 'system' | 'none'
+  /** 'register' triggers the automatic account-registration flow (qwen-ai only) */
+  mode?: 'login' | 'register'
 }
 
 const DEFAULT_TIMEOUT = 300000 // 5 minutes
 const MIN_LOGIN_TIME = 5000 // Minimum time before checking tokens (5 seconds)
 const MAX_LOAD_RETRIES = 3 // Maximum number of retry attempts for page loading
 const LOAD_RETRY_DELAY = 2000 // Delay between retry attempts (ms)
+// When the automatic registration flow fails, keep the window open for a
+// grace period so the user can finish manually AND the retained puzzle
+// watcher keeps solving freshly-refreshed captchas ("换图后接着认证"); then
+// auto-fail instead of hanging until the full login timeout expires. The
+// window is closed on completion, so this grace bounds the watcher's life.
+const REGISTER_FAIL_GRACE_MS = 120000
 
 // Common User-Agent string for the in-app login window.
 // Many provider websites reject or block the default Electron User-Agent,
@@ -62,6 +72,7 @@ export class InAppLoginManager extends EventEmitter {
   private loadRetryCount: number = 0
   private tokenCheckRunning: boolean = false
   private tokenCheckQueued: boolean = false
+  private registerFailTimer: NodeJS.Timeout | null = null
 
   constructor() {
     super()
@@ -117,11 +128,22 @@ export class InAppLoginManager extends EventEmitter {
     // blocked by provider websites that reject Electron's default UA.
     this.loginSession.setUserAgent(IN_APP_LOGIN_UA)
 
-    if (this.options?.proxyMode === 'none') {
-      this.loginSession.setProxy({ mode: 'direct' }).catch((error) => {
-        console.error('[InAppLogin] Failed to set direct proxy:', error)
+    // Apply the configured upstream proxy (manual URL or local Clash client)
+    // to the login session so registration/login egresses through it. When
+    // upstream proxy is disabled keep the legacy behavior: 'none' forces a
+    // direct connection, otherwise the system proxy is used.
+    applySessionProxy(this.loginSession)
+      .then((info) => {
+        if (!info.active && this.options?.proxyMode === 'none') {
+          return this.loginSession?.setProxy({ mode: 'direct' })
+        }
+        if (info.active) {
+          console.log(`[InAppLogin] Upstream proxy applied: ${info.url} (${info.source})`)
+        }
       })
-    }
+      .catch((error) => {
+        console.error('[InAppLogin] Failed to set proxy:', error)
+      })
 
     this.loginWindow = new BrowserWindow({
       width: 500,
@@ -141,15 +163,42 @@ export class InAppLoginManager extends EventEmitter {
     this.loginWindow.once('ready-to-show', () => {
       this.loginWindow?.show()
       this.emit('status', { status: 'ready', message: 'Login window ready - please log in' })
+
+      if (this.options?.mode === 'register') {
+        this.startRegistrationFlow()
+      }
     })
 
     this.loginWindow.on('closed', () => {
-      if (!this.isCompleted) {
-        this.complete({
-          success: false,
-          error: 'Login window was closed',
-        })
+      if (this.isCompleted) return
+
+      // Race guard: the token may already have been captured and the manager
+      // may be awaiting adapter.validateToken() (a network call that can take
+      // a few seconds). If we fail immediately here, completeWithSuccess()
+      // arriving afterwards is dropped (isCompleted already true) and the
+      // renderer sees "Login window was closed" even though the account was
+      // registered and validated successfully. Give pending validation a
+      // grace period to complete the flow first.
+      if (this.foundTokens.size > 0) {
+        console.log(
+          '[InAppLogin] Window closed while token validation is pending; waiting for validation result before failing...'
+        )
+        setTimeout(() => {
+          if (!this.isCompleted) {
+            console.log('[InAppLogin] Validation grace period expired after window close; completing as failure')
+            this.complete({
+              success: false,
+              error: 'Login window was closed',
+            })
+          }
+        }, 20_000)
+        return
       }
+
+      this.complete({
+        success: false,
+        error: 'Login window was closed',
+      })
     })
 
     // Handle page load failures (e.g. ERR_CONNECTION_CLOSED)
@@ -179,7 +228,7 @@ export class InAppLoginManager extends EventEmitter {
           if (this.isCompleted) return
           if (!this.loginWindow || this.loginWindow.isDestroyed()) return
 
-          this.loginWindow.loadURL(this.config!.loginUrl).catch((error) => {
+          this.loginWindow.loadURL(this.getStartUrl()).catch((error) => {
             if (this.loadRetryCount >= MAX_LOAD_RETRIES) {
               this.complete({
                 success: false,
@@ -200,12 +249,80 @@ export class InAppLoginManager extends EventEmitter {
   }
 
   /**
+   * The URL to load initially: the register page when running the
+   * auto-registration flow, otherwise the provider's login URL.
+   */
+  private getStartUrl(): string {
+    if (this.options?.mode === 'register' && this.options.providerType === 'qwen-ai') {
+      return QWEN_REGISTER_URL
+    }
+    return this.config?.loginUrl || ''
+  }
+
+  /**
+   * Automatic account-registration flow (currently qwen-ai only).
+   * Runs inside the visible login window; on failure the window stays open
+   * so the user can complete registration manually.
+   */
+  private startRegistrationFlow(): void {
+    if (!this.loginWindow || this.loginWindow.isDestroyed()) return
+    if (this.options?.providerType !== 'qwen-ai') {
+      this.emit('status', {
+        status: 'pending',
+        message: 'Auto-registration is only supported for Qwen AI, please register manually',
+      })
+      return
+    }
+
+    const wc = this.loginWindow.webContents
+    runQwenRegistration({
+      webContents: wc,
+      emitStatus: (message: string) => {
+        if (this.isCompleted) return
+        this.emit('status', { status: 'pending', message })
+      },
+    })
+      .then(({ address }) => {
+        console.log('[InAppLogin] Registration flow completed for', address)
+        if (this.isCompleted) return
+        this.emit('status', {
+          status: 'pending',
+          message: `注册成功 (${address})，正在完成登录...`,
+        })
+        // Token capture is handled by the regular interception; nudge a check.
+        this.delayedTokenCheck()
+      })
+      .catch((error) => {
+        console.error('[InAppLogin] Registration flow failed:', error)
+        if (this.isCompleted) return
+        const message = error instanceof Error ? error.message : String(error)
+        this.emit('status', {
+          status: 'pending',
+          message: `自动注册失败: ${message} — 可在窗口中手动完成注册`,
+        })
+        // Do not leave the caller (batch/auto-refill loop) hanging until the
+        // full login timeout: auto-fail after a short grace period unless a
+        // token was captured (manual completion) in the meantime.
+        if (this.registerFailTimer) clearTimeout(this.registerFailTimer)
+        this.registerFailTimer = setTimeout(() => {
+          this.registerFailTimer = null
+          if (this.isCompleted || this.foundTokens.size > 0) return
+          console.log('[InAppLogin] Registration failure grace period expired; completing as failure')
+          this.complete({
+            success: false,
+            error: `自动注册失败: ${message}`,
+          })
+        }, REGISTER_FAIL_GRACE_MS)
+      })
+  }
+
+  /**
    * Load the login URL with retry on failure
    */
   private loadUrlWithRetry(): void {
     if (!this.config || !this.loginWindow) return
 
-    this.loginWindow.loadURL(this.config.loginUrl).catch((error) => {
+    this.loginWindow.loadURL(this.getStartUrl()).catch((error) => {
       // This catch handles synchronous loadURL rejection.
       // The did-fail-load event handles most connection errors with retry logic.
       if (this.isCompleted) return
@@ -224,7 +341,7 @@ export class InAppLoginManager extends EventEmitter {
           if (this.isCompleted) return
           if (!this.loginWindow || this.loginWindow.isDestroyed()) return
 
-          this.loginWindow.loadURL(this.config!.loginUrl).catch((err) => {
+          this.loginWindow.loadURL(this.getStartUrl()).catch((err) => {
             if (this.loadRetryCount >= MAX_LOAD_RETRIES) {
               this.complete({
                 success: false,
@@ -797,6 +914,11 @@ export class InAppLoginManager extends EventEmitter {
   }
 
   private cleanup(): void {
+    if (this.registerFailTimer) {
+      clearTimeout(this.registerFailTimer)
+      this.registerFailTimer = null
+    }
+
     if (this.loginSession) {
       try {
         this.loginSession.webRequest.onBeforeSendHeaders(() => {})

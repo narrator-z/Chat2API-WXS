@@ -4,7 +4,12 @@ import { IpcChannels } from './channels'
 import { storeManager } from '../store/store'
 import { ProviderManager } from '../store/providers'
 import { AccountManager } from '../store/accounts'
-import { startAccountStatusScheduler } from '../store/accountStatusScheduler'
+import {
+  startAccountStatusScheduler,
+  applyAccountCheckConfig,
+  runFullCheck,
+  requestRefillToTarget,
+} from '../store/accountStatusScheduler'
 import {
   startModelUpdateScheduler,
   applyModelUpdateConfig,
@@ -14,6 +19,7 @@ import { ProviderChecker } from '../providers/checker'
 import { CustomProviderManager } from '../providers/custom'
 import { getBuiltinProviders, getBuiltinProvider } from '../providers/builtin'
 import { oauthManager } from '../oauth/manager'
+import { createTempAddress, isTempMailConfigured } from '../oauth/tempMail'
 import { ProxyServer } from '../proxy/server'
 import { proxyStatusManager } from '../proxy/status'
 import { sessionManager } from '../proxy/sessionManager'
@@ -31,7 +37,15 @@ import { PerplexityAdapter } from '../proxy/adapters/perplexity'
 import { QwenAdapter } from '../proxy/adapters/qwen'
 import { QwenAiAdapter } from '../proxy/adapters/qwen-ai'
 import { ZaiAdapter } from '../proxy/adapters/zai'
-import type { Provider, Account, ProxyStatus, ProviderCheckResult, OAuthResult, AuthType, CredentialField, LogLevel, LogEntry, ProviderVendor, AppConfig } from '../../shared/types'
+import type { Provider, Account, ProxyStatus, ProviderCheckResult, OAuthResult, AuthType, CredentialField, LogLevel, LogEntry, ProviderVendor, AppConfig, TempMailConfig, GeepassConfig, UpstreamProxyConfig, UpstreamProxyInfo, ClashProxyNode } from '../../shared/types'
+import { testGeepassToken } from '../lib/geepass'
+import {
+  fetchClashSubscription,
+  resolveUpstreamProxy,
+  invalidateUpstreamProxyCache,
+  checkUrlThroughProxy,
+} from '../lib/clashProxy'
+import { syncEmbeddedClash } from '../lib/embeddedClash'
 import type { SystemPrompt, SessionConfig, SessionRecord, ManagementApiConfig } from '../store/types'
 import type { ProviderType } from '../oauth/types'
 
@@ -243,6 +257,19 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     // Register/unregister OS-level boot autostart
     if (updates.autoStart !== undefined) {
       applyAutoStart(updates.autoStart)
+    }
+
+    // Re-apply the periodic account check schedule
+    if (
+      updates.autoCheckAccounts !== undefined ||
+      updates.autoCheckAccountsIntervalMinutes !== undefined
+    ) {
+      applyAccountCheckConfig()
+    }
+
+    // Target account count changed: check immediately whether refills are needed
+    if (updates.targetAccountCount !== undefined) {
+      requestRefillToTarget()
     }
 
     BrowserWindow.getAllWindows().forEach((win) => {
@@ -648,6 +675,13 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     return result.valid
   })
 
+  ipcMain.handle(
+    IpcChannels.ACCOUNTS_BATCH_VALIDATE,
+    async (): Promise<{ total: number; valid: number; deleted: number }> => {
+      return runFullCheck()
+    }
+  )
+
   ipcMain.handle(IpcChannels.ACCOUNTS_VALIDATE_TOKEN, async (_, providerId: string, credentials: Record<string, string>) => {
     let provider = ProviderManager.getById(providerId)
     
@@ -762,11 +796,11 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
     return await oauthManager.loginWithToken(data.providerId, data.providerType as ProviderType, data.token, data.realUserID, data.mimoUserId, data.mimoPhToken)
   })
 
-  ipcMain.handle(IpcChannels.OAUTH_START_IN_APP_LOGIN, async (_, data: { providerId: string, providerType: ProviderVendor, timeout?: number }): Promise<OAuthResult> => {
-    console.log('Starting in-app OAuth login:', data.providerId, data.providerType)
+  ipcMain.handle(IpcChannels.OAUTH_START_IN_APP_LOGIN, async (_, data: { providerId: string, providerType: ProviderVendor, timeout?: number, mode?: 'login' | 'register' }): Promise<OAuthResult> => {
+    console.log('Starting in-app OAuth login:', data.providerId, data.providerType, 'mode:', data.mode || 'login')
     const config = storeManager.getConfig()
     const proxyMode = (config as any).oauthProxyMode || 'system'
-    return await oauthManager.startInAppLogin(data.providerId, data.providerType as ProviderType, data.timeout, proxyMode)
+    return await oauthManager.startInAppLogin(data.providerId, data.providerType as ProviderType, data.timeout, proxyMode, data.mode)
   })
 
   ipcMain.handle(IpcChannels.OAUTH_CANCEL_IN_APP_LOGIN, async (): Promise<void> => {
@@ -777,6 +811,139 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
   ipcMain.handle(IpcChannels.OAUTH_IN_APP_LOGIN_STATUS, async (): Promise<boolean> => {
     return oauthManager.isInAppLoginOpen()
   })
+
+  // ==================== Temp Mail (auto-registration) Handlers ====================
+
+  ipcMain.handle(IpcChannels.TEMP_MAIL_GET_CONFIG, async (): Promise<TempMailConfig> => {
+    // Return the RAW stored values (empty when never configured) so the
+    // settings dialog never pre-fills secrets. There are no bundled
+    // defaults: the service must be configured by the user.
+    const stored = (storeManager.getConfig() as { tempMail?: Partial<TempMailConfig> }).tempMail
+    return {
+      apiUrl: stored?.apiUrl || '',
+      adminPassword: stored?.adminPassword || '',
+      domain: stored?.domain || '',
+    }
+  })
+
+  ipcMain.handle(IpcChannels.TEMP_MAIL_UPDATE_CONFIG, async (_, updates: Partial<TempMailConfig>): Promise<TempMailConfig> => {
+    const current = (storeManager.getConfig() as { tempMail?: Partial<TempMailConfig> }).tempMail || {}
+    const merged: TempMailConfig = {
+      apiUrl: updates.apiUrl !== undefined ? updates.apiUrl.trim() : (current.apiUrl || ''),
+      adminPassword: updates.adminPassword !== undefined ? updates.adminPassword : (current.adminPassword || ''),
+      domain: updates.domain !== undefined ? updates.domain.trim() : (current.domain || ''),
+    }
+    ConfigManager.update({ tempMail: merged })
+    // Return the raw merged values (not defaults-filled) for consistency with GET.
+    return merged
+  })
+
+  ipcMain.handle(IpcChannels.TEMP_MAIL_IS_CONFIGURED, async (): Promise<boolean> => {
+    return isTempMailConfigured()
+  })
+
+  ipcMain.handle(IpcChannels.TEMP_MAIL_TEST, async (): Promise<{ success: boolean; address?: string; error?: string }> => {
+    try {
+      const addr = await createTempAddress()
+      return { success: true, address: addr.address }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
+  })
+
+  // ==================== Geepass (captcha recognition) Handlers ====================
+
+  ipcMain.handle(IpcChannels.GEEPASS_GET_CONFIG, async (): Promise<GeepassConfig> => {
+    const stored = (storeManager.getConfig() as { geepass?: Partial<GeepassConfig> }).geepass
+    return {
+      enabled: stored?.enabled ?? false,
+      token: stored?.token || '',
+      type: stored?.type === 20111 ? 20111 : 20110,
+    }
+  })
+
+  ipcMain.handle(IpcChannels.GEEPASS_UPDATE_CONFIG, async (_, updates: Partial<GeepassConfig>): Promise<GeepassConfig> => {
+    const current = (storeManager.getConfig() as { geepass?: Partial<GeepassConfig> }).geepass || {}
+    const merged: GeepassConfig = {
+      enabled: updates.enabled !== undefined ? updates.enabled : (current.enabled ?? false),
+      token: updates.token !== undefined ? updates.token.trim() : (current.token || ''),
+      type: updates.type !== undefined ? updates.type : (current.type === 20111 ? 20111 : 20110),
+    }
+    ConfigManager.update({ geepass: merged })
+    return merged
+  })
+
+  ipcMain.handle(IpcChannels.GEEPASS_TEST, async (): Promise<{ success: boolean; message: string }> => {
+    try {
+      const stored = (storeManager.getConfig() as { geepass?: Partial<GeepassConfig> }).geepass
+      return await testGeepassToken(stored?.token || '')
+    } catch (error) {
+      return { success: false, message: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  // ==================== Upstream Proxy (Clash) Handlers ====================
+
+  ipcMain.handle(IpcChannels.UPSTREAM_PROXY_GET_CONFIG, async (): Promise<UpstreamProxyConfig> => {
+    const stored = (storeManager.getConfig() as { upstreamProxy?: Partial<UpstreamProxyConfig> }).upstreamProxy
+    return {
+      enabled: stored?.enabled ?? false,
+      source: stored?.source === 'manual' ? 'manual' : stored?.source === 'embedded' ? 'embedded' : 'clash',
+      manualUrl: stored?.manualUrl || '',
+      subscriptionUrl: stored?.subscriptionUrl || '',
+      mixedPort: stored?.mixedPort,
+      selectedNode: stored?.selectedNode || '',
+    }
+  })
+
+  ipcMain.handle(IpcChannels.UPSTREAM_PROXY_UPDATE_CONFIG, async (_, updates: Partial<UpstreamProxyConfig>): Promise<UpstreamProxyConfig> => {
+    const current = (storeManager.getConfig() as { upstreamProxy?: Partial<UpstreamProxyConfig> }).upstreamProxy || {}
+    const merged: UpstreamProxyConfig = {
+      enabled: updates.enabled !== undefined ? updates.enabled : (current.enabled ?? false),
+      source: updates.source !== undefined ? updates.source : (current.source === 'manual' ? 'manual' : current.source === 'embedded' ? 'embedded' : 'clash'),
+      manualUrl: updates.manualUrl !== undefined ? updates.manualUrl.trim() : (current.manualUrl || ''),
+      subscriptionUrl: updates.subscriptionUrl !== undefined ? updates.subscriptionUrl.trim() : (current.subscriptionUrl || ''),
+      mixedPort: updates.mixedPort !== undefined ? updates.mixedPort : current.mixedPort,
+      selectedNode: updates.selectedNode !== undefined ? updates.selectedNode : (current.selectedNode || ''),
+    }
+    ConfigManager.update({ upstreamProxy: merged })
+    invalidateUpstreamProxyCache()
+    void syncEmbeddedClash()
+    return merged
+  })
+
+  ipcMain.handle(IpcChannels.UPSTREAM_PROXY_TEST, async (): Promise<UpstreamProxyInfo> => {
+    try {
+      invalidateUpstreamProxyCache()
+      const info = await resolveUpstreamProxy()
+      if (info.active && info.url) {
+        // Verify real connectivity through the candidate proxy.
+        const ok = await checkUrlThroughProxy(info.url, 'https://chat.qwen.ai')
+        if (!ok) {
+          return { ...info, active: false, message: `代理 ${info.url} 无法连通目标站点` }
+        }
+      }
+      return info
+    } catch (error) {
+      return { active: false, message: error instanceof Error ? error.message : String(error) }
+    }
+  })
+
+  ipcMain.handle(
+    IpcChannels.UPSTREAM_PROXY_PARSE_SUBSCRIPTION,
+    async (_, url?: string): Promise<{ nodeCount: number; nodes: ClashProxyNode[]; mixedPort?: number; error?: string }> => {
+      const target = (url || '').trim() ||
+        ((storeManager.getConfig() as { upstreamProxy?: Partial<UpstreamProxyConfig> }).upstreamProxy?.subscriptionUrl || '').trim()
+      if (!target) {
+        return { nodeCount: 0, nodes: [], error: '请先填写订阅地址' }
+      }
+      const info = await fetchClashSubscription(target)
+      return { nodeCount: info.nodeCount, nodes: info.nodes, mixedPort: info.mixedPort, error: info.error }
+    }
+  )
 
   ipcMain.handle(IpcChannels.OAUTH_VALIDATE_TOKEN, async (_, data: { providerId: string, providerType: ProviderVendor, credentials: Record<string, string> }) => {
     return await oauthManager.validateToken(data.providerId, data.providerType as ProviderType, data.credentials)
@@ -818,7 +985,19 @@ export async function registerIpcHandlers(mainWindow: BrowserWindow | null): Pro
   })
 
   ipcMain.handle(IpcChannels.LOGS_EXPORT, async (_, format?: 'json' | 'txt'): Promise<string> => {
-    return storeManager.exportLogs(format)
+    const { app } = await import('electron')
+    const fs = await import('fs/promises')
+    const path = await import('path')
+    
+    const content = storeManager.exportLogs(format)
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, -5)
+    const ext = format === 'json' ? 'json' : 'txt'
+    const filename = `app-logs-${timestamp}.${ext}`
+    
+    const downloadsPath = path.join(app.getPath('downloads'), filename)
+    await fs.writeFile(downloadsPath, content, 'utf-8')
+    
+    return downloadsPath
   })
 
   ipcMain.handle(IpcChannels.LOGS_GET_BY_ID, async (_, id: string): Promise<LogEntry | undefined> => {

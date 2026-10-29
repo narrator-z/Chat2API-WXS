@@ -12,6 +12,11 @@ import type {
   LogEntry,
   ProviderVendor,
   AppConfig,
+  TempMailConfig,
+  GeepassConfig,
+  UpstreamProxyConfig,
+  UpstreamProxyInfo,
+  ClashProxyNode,
   SystemPrompt,
   PromptType,
   EffectiveModel,
@@ -201,6 +206,27 @@ const accountsAPI = {
     ipcRenderer.on(IpcChannels.ACCOUNTS_STATUS_CHANGED, handler)
     return () => ipcRenderer.removeListener(IpcChannels.ACCOUNTS_STATUS_CHANGED, handler)
   },
+
+  batchValidate: (): Promise<{ total: number; valid: number; deleted: number }> =>
+    ipcRenderer.invoke(IpcChannels.ACCOUNTS_BATCH_VALIDATE),
+
+  onBatchValidateProgress: (callback: (event: { current: number; total: number; name: string }) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { current: number; total: number; name: string }) => callback(data)
+    ipcRenderer.on(IpcChannels.ACCOUNTS_BATCH_VALIDATE_PROGRESS, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.ACCOUNTS_BATCH_VALIDATE_PROGRESS, handler)
+  },
+
+  onRemoved: (callback: (info: { id: string; providerId: string; name: string }) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, info: { id: string; providerId: string; name: string }) => callback(info)
+    ipcRenderer.on(IpcChannels.ACCOUNTS_REMOVED, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.ACCOUNTS_REMOVED, handler)
+  },
+
+  onRefillNeeded: (callback: (requests: { providerId: string; count: number }[]) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, requests: { providerId: string; count: number }[]) => callback(requests)
+    ipcRenderer.on(IpcChannels.ACCOUNTS_REFILL_NEEDED, handler)
+    return () => ipcRenderer.removeListener(IpcChannels.ACCOUNTS_REFILL_NEEDED, handler)
+  },
 }
 
 type ProviderType = ProviderVendor
@@ -250,8 +276,8 @@ const oauthAPI = {
   getStatus: (): Promise<string> =>
     ipcRenderer.invoke(IpcChannels.OAUTH_GET_STATUS),
   
-  startInAppLogin: (providerId: string, providerType: ProviderType, timeout?: number): Promise<OAuthResult> =>
-    ipcRenderer.invoke(IpcChannels.OAUTH_START_IN_APP_LOGIN, { providerId, providerType, timeout }),
+  startInAppLogin: (providerId: string, providerType: ProviderType, timeout?: number, mode?: 'login' | 'register'): Promise<OAuthResult> =>
+    ipcRenderer.invoke(IpcChannels.OAUTH_START_IN_APP_LOGIN, { providerId, providerType, timeout, mode }),
   
   cancelInAppLogin: (): Promise<void> =>
     ipcRenderer.invoke(IpcChannels.OAUTH_CANCEL_IN_APP_LOGIN),
@@ -270,6 +296,47 @@ const oauthAPI = {
     ipcRenderer.on(IpcChannels.OAUTH_PROGRESS, handler)
     return () => ipcRenderer.removeListener(IpcChannels.OAUTH_PROGRESS, handler)
   },
+}
+
+const tempMailAPI = {
+  getConfig: (): Promise<TempMailConfig> =>
+    ipcRenderer.invoke(IpcChannels.TEMP_MAIL_GET_CONFIG),
+
+  updateConfig: (updates: Partial<TempMailConfig>): Promise<TempMailConfig> =>
+    ipcRenderer.invoke(IpcChannels.TEMP_MAIL_UPDATE_CONFIG, updates),
+
+  test: (): Promise<{ success: boolean; address?: string; error?: string }> =>
+    ipcRenderer.invoke(IpcChannels.TEMP_MAIL_TEST),
+
+  isConfigured: (): Promise<boolean> =>
+    ipcRenderer.invoke(IpcChannels.TEMP_MAIL_IS_CONFIGURED),
+}
+
+const geepassAPI = {
+  getConfig: (): Promise<GeepassConfig> =>
+    ipcRenderer.invoke(IpcChannels.GEEPASS_GET_CONFIG),
+
+  updateConfig: (updates: Partial<GeepassConfig>): Promise<GeepassConfig> =>
+    ipcRenderer.invoke(IpcChannels.GEEPASS_UPDATE_CONFIG, updates),
+
+  test: (): Promise<{ success: boolean; message: string }> =>
+    ipcRenderer.invoke(IpcChannels.GEEPASS_TEST),
+}
+
+const upstreamProxyAPI = {
+  getConfig: (): Promise<UpstreamProxyConfig> =>
+    ipcRenderer.invoke(IpcChannels.UPSTREAM_PROXY_GET_CONFIG),
+
+  updateConfig: (updates: Partial<UpstreamProxyConfig>): Promise<UpstreamProxyConfig> =>
+    ipcRenderer.invoke(IpcChannels.UPSTREAM_PROXY_UPDATE_CONFIG, updates),
+
+  test: (): Promise<UpstreamProxyInfo> =>
+    ipcRenderer.invoke(IpcChannels.UPSTREAM_PROXY_TEST),
+
+  parseSubscription: (
+    url?: string
+  ): Promise<{ nodeCount: number; nodes: ClashProxyNode[]; mixedPort?: number; error?: string }> =>
+    ipcRenderer.invoke(IpcChannels.UPSTREAM_PROXY_PARSE_SUBSCRIPTION, url),
 }
 
 interface LogFilter {
@@ -714,6 +781,9 @@ const electronAPI = {
   providers: providersAPI,
   accounts: accountsAPI,
   oauth: oauthAPI,
+  tempMail: tempMailAPI,
+  geepass: geepassAPI,
+  upstreamProxy: upstreamProxyAPI,
   logs: logsAPI,
   requestLogs: requestLogsAPI,
   statistics: statisticsAPI,
